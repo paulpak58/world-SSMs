@@ -127,6 +127,50 @@ class MegaBlock(nn.Module):
         nn.init.constant_(self.beta, 0.0)
 
 
+    def initial(self, bs):
+        pass
+
+    
+    def observe(self, embed, action, is_first, state=None):
+        pass
+
+    def imagine(self, action, state=None):
+        pass
+
+    def get_dist(self, state, argmax=False):
+        pass
+
+
+    def obs_step(self, prev_state, prev_action, embed, is_first):
+        pass
+
+    def img_step(self, prev_state, prev_action):
+        pass
+
+    def get_stoch(self, deter):
+        pass
+
+
+    def dyn_loss(self, post, prior, impl='kl', free=1.0):
+        pass
+
+    def rep_loss(self, post, prior, impl='kl', free=1.0):
+        pass 
+
+
+    ############ INNER TBD ############
+    def _gru(self, x, deter):
+        pass
+
+    def _stats(self, name, x):
+        pass
+
+    def _mask(self, value, mask):
+        pass
+
+
+
+
     def forward(
         self,
         x,
