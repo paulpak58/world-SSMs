@@ -1,0 +1,2 @@
+2023-06-24 18:48:08 queen process_watcher[1680427] INFO Process watcher started between parent 1674845 and child 1678052 
+2023-06-24 20:09:50 queen process_watcher[1680427] INFO Child is not running anymore, launcher can terminate.

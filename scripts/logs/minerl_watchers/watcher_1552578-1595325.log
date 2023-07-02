@@ -1,0 +1,8 @@
+2023-06-23 20:24:03 queen process_watcher[1595506] INFO Process watcher started between parent 1552578 and child 1595325 
+2023-06-23 20:24:45 queen process_watcher[1595506] INFO Parent is not running, hence we need terminate the child.
+2023-06-23 20:24:45 queen process_watcher[1595506] INFO About to reap process tree of 1595325:launchClient.sh:/usr/bin/bash i sleeping, owner 1, printing process tree status in termination order:
+2023-06-23 20:24:45 queen process_watcher[1595506] INFO 	-1595329:java:/usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java i sleeping, owner 1595325
+2023-06-23 20:24:45 queen process_watcher[1595506] INFO 	-1595325:launchClient.sh:/usr/bin/bash i sleeping, owner 1
+2023-06-23 20:24:45 queen process_watcher[1595506] INFO Trying to SIGTERM 1595329:java:/usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java i sleeping, owner 1595325
+2023-06-23 20:24:46 queen process_watcher[1595506] INFO Process psutil.Process(pid=1595329, name='java', status='terminated', started='20:24:01') terminated with exit code None
+2023-06-23 20:24:46 queen process_watcher[1595506] INFO Process psutil.Process(pid=1595325, name='launchClient.sh', status='terminated', started='20:24:01') does not exist or is zombie.

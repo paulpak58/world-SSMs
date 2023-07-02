@@ -1,0 +1,2 @@
+2023-06-23 16:34:15 queen process_watcher[1551714] INFO Process watcher started between parent 1546822 and child 1549021 
+2023-06-23 16:34:33 queen process_watcher[1551714] INFO Parent is not running, hence we need terminate the child.
