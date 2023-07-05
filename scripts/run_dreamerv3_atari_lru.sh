@@ -7,21 +7,27 @@ log=${home}/world-SSMs/logdir
 
 source ${conda} wssm
 
+
+####################### TEST LOG ###########################
+# logdir:
+#       - run_atari_lru: small lru [CUDA 0] 
+#       - run_atari_gru: small gru [CUDA 1]
+#############################################################
 python ${home}/world-SSMs/main.py \
     --configs atari small \
-    --logdir ${log}/run_atari_test \
+    --logdir ${log}/run_atari_gru \
     --replay_size 1000000.0 \
     --replay_online False \
     --jax.platform gpu \
-    --jax.policy_devices 0 \
+    --jax.policy_devices 1 \
     --jax.train_devices 1 \
     --jax.prealloc False \
     --run.script train \
-    --run.steps 1e5 \
+    --run.steps 1e6 \
     --run.eval_every 1e5 \
     --batch_size 16 \
+    --imag_horizon 16
     # --run.train_ratio 32 \
-
 
     #--encoder.mlp_keys 'vector' \
     #--decoder.mlp_keys 'vector' \

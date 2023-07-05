@@ -398,7 +398,7 @@ class Optimizer(nj.Module):
         s = k.split('/')[2]
         if s=='rssm':
           rssms_cnt.append(np.prod(v.shape))
-      print(f'RSSM has {sum(rssms_cnt):,} variables.')
+      print(f'RSSM has {sum(rssms_cnt):,} variables.') if sum(rssms_cnt)!=0 else None
       self.PARAM_COUNTS[self.path] = count
     if parallel():
       grads = tree_map(lambda x: jax.lax.pmean(x, 'i'), grads)

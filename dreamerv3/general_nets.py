@@ -16,11 +16,14 @@ cast = jaxutils.cast_to_compute
 
 
 
-class LRU_RSSM(nj.Module):
+
+class RSSM(nj.Module):
+
+  ''' RSSM with either GRU or LRU hidden units '''
 
   def __init__(
       self, deter=1024, stoch=32, classes=32, unroll=False, initial='learned',
-      unimix=0.01, action_clip=1.0, **kw):
+      unimix=0.01, action_clip=1.0, hidden='lru', **kw):
     self._deter = deter
     self._stoch = stoch
     self._classes = classes
@@ -29,7 +32,13 @@ class LRU_RSSM(nj.Module):
     self._unimix = unimix
     self._action_clip = action_clip
     self._kw = kw
+    self._hidden = hidden
 
+
+
+  ########################################
+  # Initial consistent with original RSSM
+  ########################################
   def initial(self, bs):
     if self._classes:
       state = dict(
@@ -51,14 +60,24 @@ class LRU_RSSM(nj.Module):
       return cast(state)
     else:
       raise NotImplementedError(self._initial)
-    
-  def init_lru_parameters(self, N, H, r_min=0, r_max=1, max_phase=6.28):
+
+  ########################################
+  # Initialize complex value matrices
+  ########################################
+  def init_lru_parameters(self, bs, r_min=0, r_max=1, max_phase=6.28):
+    ''' 
+      Skeleton method provided in paper use N, H
+      In our case, N is batch size (bs), and H is given by self._deter
+    '''
+    N = bs
+    H = self._deter
+
     # N: state dimension, H: model dimension
-    # Lambda is initialized as complex value matrix, uniformly distributed
-    # on ring between r_min and r_max with phase in [0, max_phase]
     u1 = np.random.uniform(size=(N,))
     u2 = np.random.uniform(size=(N,))
-    nu_log = np.log(-0.5*np.log(u1*(r_max**2-r_min**2) + r_min**2))
+
+    # Nu and theta are learnable parameters
+    nu_log = np.log(-0.5*np.log(u1*(r_max**2-r_min**2) + r_min**2))               # (Lemma 3.2)
     theta_log = np.log(max_phase*u2)
 
     # Glorot initialized input/output projection matrices
@@ -68,13 +87,19 @@ class LRU_RSSM(nj.Module):
     C_im = np.random.normal(size=(H,N))/np.sqrt(N)
     D = np.random.normal(size=(H,))
 
-    # Norm factor
-    diag_lambda = np.exp(-np.exp(nu_log) + 1j*np.exp(theta_log))
-    gamma_log = np.log(np.sqrt(1-np.abs(diag_lambda)**2))
+    # Lambda is initialized as complex value matrix unformly distributed
+    # On a ring between [r_min, r_max] with phase in [0, max_phase]
+    diag_lambda = np.exp(-np.exp(nu_log) + 1j*np.exp(theta_log))                  # (Sec 3.3): Enforcing Stability
+
+    # Normalization factor that gets multiplied element-wise with Bu_{k}
+    gamma_log = np.log(np.sqrt(1-np.abs(diag_lambda)**2))                         # (Eq. 7)
 
     return nu_log, theta_log, B_re, B_im, C_re, C_im, D, gamma_log
 
 
+  #################################
+  # Full observation parallel scan
+  #################################
   def observe(self, embed, action, is_first, state=None):
     swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
     if state is None:
@@ -87,6 +112,9 @@ class LRU_RSSM(nj.Module):
     prior = {k: swap(v) for k, v in prior.items()}
     return post, prior
 
+  #################################
+  # Full imagination parallel scan
+  #################################
   def imagine(self, action, state=None):
     swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
     state = self.initial(action.shape[0]) if state is None else state
@@ -96,6 +124,85 @@ class LRU_RSSM(nj.Module):
     prior = {k: swap(v) for k, v in prior.items()}
     return prior
 
+
+
+  ######################################################################
+  # Observation step uses the imagination step to retrieve the prior
+  # and concatenates it with the current latent embedding to compute posterior
+  ######################################################################
+  def obs_step(self, prev_state, prev_action, embed, is_first):
+    is_first = cast(is_first)
+    prev_action = cast(prev_action)
+    if self._action_clip > 0.0:
+      prev_action *= sg(self._action_clip / jnp.maximum(self._action_clip, jnp.abs(prev_action)))
+
+    # Initialize by zeroing the first state
+    prev_state, prev_action = jax.tree_util.tree_map(
+        lambda x: self._mask(x, 1.0 - is_first), (prev_state, prev_action))
+    prev_state = jax.tree_util.tree_map(
+        lambda x, y: x + self._mask(y, is_first),
+        prev_state, self.initial(len(is_first)))
+
+    # the actor-critic only operates on model states and benefit from Markovian representation 
+    prior = self.img_step(prev_state, prev_action)                                  # (DreamerV3. Sec. Actor-Critic)
+
+    # embed is the next observation in the latent space
+    x = jnp.concatenate([prior['deter'], embed], -1)
+
+    # Encoder p_{phi} which takes in {h_t, x_t}
+    x = self.get('obs_out', Linear, **self._kw)(x)                                  # (DreamerV3 Eq. 3)
+    stats = self._stats('obs_stats', x)
+    dist = self.get_dist(stats)
+    stoch = dist.sample(seed=nj.rng())
+    post = {'stoch': stoch, 'deter': prior['deter'], **stats}
+    return cast(post), cast(prior)
+
+
+  ############################################################################
+  # Imagination step takes in the previous hidden state which is composed of both a
+  # deterministic and stochastic component and outputs out the next hidden state
+  ############################################################################
+  def img_step(self, prev_state, prev_action):
+    # Stochastic Posterior
+    prev_stoch = prev_state['stoch']
+    prev_action = cast(prev_action)
+    if self._action_clip > 0.0:
+      prev_action *= sg(self._action_clip / jnp.maximum(self._action_clip, jnp.abs(prev_action)))
+    if self._classes:
+      shape = prev_stoch.shape[:-2] + (self._stoch * self._classes,)
+      prev_stoch = prev_stoch.reshape(shape)
+    if len(prev_action.shape) > len(prev_stoch.shape):  # 2D actions.
+      shape = prev_action.shape[:-2] + (np.prod(prev_action.shape[-2:]),)
+      prev_action = prev_action.reshape(shape)
+
+    # In an RSSM, both the stochastic state and previous action are inputs
+    x = jnp.concatenate([prev_stoch, prev_action], -1)
+    x = self.get('img_in', Linear, **self._kw)(x) 
+
+    # Input is deter, stoch, action; Output is next hidden state
+    if self._hidden=='gru':
+      x, deter = self._gru(x, prev_state['deter'])                            
+    elif self._hidden=='lru':
+      lru_params = self.init_lru_parameters(bs=x.shape[0])
+      x, deter = self._lru(x, prev_state['deter'], lru_params)
+    else:
+      raise NotImplementedError
+
+    # Transition/Dynamics predictor
+    x = self.get('img_out', Linear, **self._kw)(x)
+    stats = self._stats('img_stats', x)
+    dist = self.get_dist(stats)
+    stoch = dist.sample(seed=nj.rng())                                      # (DreamerV3 Eq. 3)
+
+    # model state is the concatenation of deterministic hidden state and sample of stochastic 
+    prior = {'stoch': stoch, 'deter': deter, **stats}                       # (DreamerV3 Sec. 2)
+    return cast(prior)
+
+
+  ####################################################
+  # Discretize continuous action space into classes or
+  # use a multivariate gaussian for continuous actions
+  ####################################################
   def get_dist(self, state, argmax=False):
     if self._classes:
       logit = state['logit'].astype(f32)
@@ -105,54 +212,30 @@ class LRU_RSSM(nj.Module):
       std = state['std'].astype(f32)
       return tfd.MultivariateNormalDiag(mean, std)
 
-  def obs_step(self, prev_state, prev_action, embed, is_first):
-    is_first = cast(is_first)
-    prev_action = cast(prev_action)
-    if self._action_clip > 0.0:
-      prev_action *= sg(self._action_clip / jnp.maximum(
-          self._action_clip, jnp.abs(prev_action)))
-    prev_state, prev_action = jax.tree_util.tree_map(
-        lambda x: self._mask(x, 1.0 - is_first), (prev_state, prev_action))
-    prev_state = jax.tree_util.tree_map(
-        lambda x, y: x + self._mask(y, is_first),
-        prev_state, self.initial(len(is_first)))
-    prior = self.img_step(prev_state, prev_action)
-    x = jnp.concatenate([prior['deter'], embed], -1)
-    x = self.get('obs_out', Linear, **self._kw)(x)
-    stats = self._stats('obs_stats', x)
-    dist = self.get_dist(stats)
-    stoch = dist.sample(seed=nj.rng())
-    post = {'stoch': stoch, 'deter': prior['deter'], **stats}
-    return cast(post), cast(prior)
 
-  def img_step(self, prev_state, prev_action):
-    prev_stoch = prev_state['stoch']
-    prev_action = cast(prev_action)
-    if self._action_clip > 0.0:
-      prev_action *= sg(self._action_clip / jnp.maximum(
-          self._action_clip, jnp.abs(prev_action)))
-    if self._classes:
-      shape = prev_stoch.shape[:-2] + (self._stoch * self._classes,)
-      prev_stoch = prev_stoch.reshape(shape)
-    if len(prev_action.shape) > len(prev_stoch.shape):  # 2D actions.
-      shape = prev_action.shape[:-2] + (np.prod(prev_action.shape[-2:]),)
-      prev_action = prev_action.reshape(shape)
-    x = jnp.concatenate([prev_stoch, prev_action], -1)
-    x = self.get('img_in', Linear, **self._kw)(x)
-    x, deter = self._gru(x, prev_state['deter'])
-    x = self.get('img_out', Linear, **self._kw)(x)
-    stats = self._stats('img_stats', x)
-    dist = self.get_dist(stats)
-    stoch = dist.sample(seed=nj.rng())
-    prior = {'stoch': stoch, 'deter': deter, **stats}
-    return cast(prior)
-
+  ####################################################
+  # Stochastic component which is retrieved by passing
+  # the hidden state through a dense layer and sampling
+  ####################################################
   def get_stoch(self, deter):
     x = self.get('img_out', Linear, **self._kw)(deter)
     stats = self._stats('img_stats', x)
     dist = self.get_dist(stats)
     return cast(dist.mode())
+  
+  ###################################
+  # Helper for linear recurrent scan
+  ###################################
+  def _binary_operator_diag(self, element_i, element_j):
+    ''' Binary operator for parallel scan of linear recurrence '''
+    a_i, bu_i = element_i
+    a_j, bu_j = element_j
+    return a_i*a_j, a_j*bu_i + bu_j
 
+
+  ################################
+  # Default GRU Hidden component
+  ################################
   def _gru(self, x, deter):
     x = jnp.concatenate([deter, x], -1)
     kw = {**self._kw, 'act': 'none', 'units': 3 * self._deter}
@@ -161,35 +244,48 @@ class LRU_RSSM(nj.Module):
     reset = jax.nn.sigmoid(reset)
     cand = jnp.tanh(reset * cand)
     update = jax.nn.sigmoid(update - 1)
-    deter = update * cand + (1 - update) * deter
+    deter = update * cand + (1 - update) * deter                              # (B, 512)
     return deter, deter
-  
 
-  def _lru(self, x, deter):
-    ''' Ou'''
+  ####################################################
+  # From the Resurrecting Recurrent Neural Networks work
+  ####################################################
+  def _lru(self, x, deter, lru_params):
 
-  def _binary_operator_diag(self, element_i, element_j):
-    ''' Binary operator for parallel scan of linear recurrence '''
-    a_i, bu_i = element_i
-    a_j, bu_j = element_j
-    return a_i*a_j, a_j*bu_i + bu_j
+    # Extract out SSM parameters
+    nu_log, theta_log, B_re, B_im, C_re, C_im, D, gamma_log = lru_params
 
-  def lru_forward(self, lru_params, input):
-      nu_log, theta_log, B_re, B_im, C_re, C_im, D, gamma_log = lru_params
+    # Reconstruct diagonal lambda from nu_log and theta_log
+    Lambda = jnp.exp(-jnp.exp(nu_log) + 1j*jnp.exp(theta_log))                # (Sec 3.3) Enforcing Stability
 
-      # Materialize diagonal of Lambda and projections
-      Lambda = jnp.exp(-jnp.exp(nu_log) + 1j*jnp.exp(theta_log))
-      B_norm = (B_re + 1j*B_im) * jnp.expand_dims(jnp.exp(gamma_log), axis=-1)
-      C = C_re + 1j*C_im
+    # Materialize projections
+    gamma = jnp.expand_dims(jnp.exp(gamma_log), axis=-1)
+    B_norm = (B_re + 1j*B_im) * gamma                                         # (Eq 7) Norm Factor
+    C = C_re + 1j*C_im
 
-      # LRU + output projection
-      Lambda_elements = jnp.repeat(Lambda[None, ...], input.shape[0], axis=0)
-      Bu_elements = jax.vmap(lambda u: B_norm @ u)(input)
-      elements = (Lambda_elements, Bu_elements)
-      _, inner_states = jax.lax.associative_scan(self._binary_operator_diag, elements)
-      y = jax.vmap(lambda x,u: (C @ x).real + D*u)(inner_states, input)
+    # Expand Lambda to match batch size
+    Lambda = jnp.repeat(Lambda[None, ...], x.shape[0], axis=0)
+    # First term of Eq 7
+    '''
+    print(f'Lamba shape {Lambda.shape}')
+    print(f' deter shape {deter.shape}')
+    print(f' x shape {x.shape}[]')
+    Lambda_state_elements = jax.vmap(lambda x: Lambda @ x)(deter) 
+    '''
+    Lambda_state_elements = Lambda
 
-      return y 
+    # Second term of Eq 7
+    Bu_elements = jax.vmap(lambda u: B_norm @ u)(x)
+
+    # Parallel scan of linear recurrence 
+    elements = (Lambda_state_elements, Bu_elements)
+    _, inner_states = jax.lax.associative_scan(self._binary_operator_diag, elements)
+
+    y = jax.vmap(lambda x,u: (C @ x).real + D*u)(inner_states, x)
+
+    deter = inner_states
+
+    return y, y
 
 
 
