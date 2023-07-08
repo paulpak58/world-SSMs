@@ -7,8 +7,8 @@ import warnings
 import argparse 
 import dreamerv3
 from dreamerv3 import embodied
-# from dreamerv3 import agent as agt
-from dreamerv3 import general_agent as agt
+from dreamerv3 import agent as agt
+# from dreamerv3 import general_agent as agt
 from dreamerv3.embodied import wrappers
 from dreamerv3.embodied.envs import from_gym
 from functools import partial

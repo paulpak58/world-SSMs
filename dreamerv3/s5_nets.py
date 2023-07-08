@@ -33,8 +33,6 @@ class RSSM(nj.Module):
     self._action_clip = action_clip
     self._kw = kw
     self._hidden = hidden
-    
-    
 
 
 
@@ -125,83 +123,6 @@ class RSSM(nj.Module):
     prior = jaxutils.scan(self.img_step, action, state, self._unroll)
     prior = {k: swap(v) for k, v in prior.items()}
     return prior
-  
-
-  def observe(self, embed, action, is_first, state=None):
-
-
-  def imagine(self, action, state=None):
-    swap = lambda x: x.transpose([1,0] + list(range(2, len(x.shape))))
-
-    if state is None:
-      nu_log, theta_log, B_re, B_im, C_re, C_im, D, gamma_log = self.init_lru_parameters(action.shape[0])
-    else:
-
-
-    state = self.initial(action.shape[0]) if state is None else state
-    assert isinstance(state, dict), state
-    action = swap(action)
-
-    # [Sec 3.3] Enforcing Stability
-    Lambda = jnp.exp(-jnp.exp(nu_log) + 1j*jnp.exp(theta_log))
-    gamma = jnp.expand_dims(jnp.exp(gamma_log), axis=-1)
-    B_norm = (B_re + 1j*B_im) * gamma
-    C = C_re + 1j*C_im
-
-
-    # x_k = Lambda @ x_{k-1} + B @ u_{k-1}
-    Lambda_elements = jnp.repeat(Lambda[None], action.shape[0], axis=0)
-    Bu_elements = jax.vmap(lambda u: B_norm @ u)(action)
-    elements = (Lambda_elements, Bu_elements)
-    _, inner_states = jax.lax.associative_scan(binary_operator, elements)
-
-    # y_k = C @ x_k + D @ u_k
-    y = jax.vmap(lambda x,u: (C @ x).real + D*u)(inner_states, action)
-    
-    return inner_states, y
-
-
-  ####################################################
-  # From the Resurrecting Recurrent Neural Networks work
-  ####################################################
-  def _lru(self, x, deter, lru_params):
-
-    # Extract out SSM parameters
-    nu_log, theta_log, B_re, B_im, C_re, C_im, D, gamma_log = lru_params
-
-    # Reconstruct diagonal lambda from nu_log and theta_log
-    Lambda = jnp.exp(-jnp.exp(nu_log) + 1j*jnp.exp(theta_log))                # (Sec 3.3) Enforcing Stability
-
-    # Materialize projections
-    gamma = jnp.expand_dims(jnp.exp(gamma_log), axis=-1)
-    B_norm = (B_re + 1j*B_im) * gamma                                         # (Eq 7) Norm Factor
-    C = C_re + 1j*C_im
-
-    # Expand Lambda to match batch size
-    Lambda = jnp.repeat(Lambda[None, ...], x.shape[0], axis=0)
-    # First term of Eq 7
-    '''
-    print(f'Lamba shape {Lambda.shape}')
-    print(f' deter shape {deter.shape}')
-    print(f' x shape {x.shape}[]')
-    Lambda_state_elements = jax.vmap(lambda x: Lambda @ x)(deter) 
-    '''
-    Lambda_state_elements = Lambda
-
-    # Second term of Eq 7
-    Bu_elements = jax.vmap(lambda u: B_norm @ u)(x)
-
-    # Parallel scan of linear recurrence 
-    elements = (Lambda_state_elements, Bu_elements)
-    _, inner_states = jax.lax.associative_scan(self._binary_operator_diag, elements)
-
-    y = jax.vmap(lambda x,u: (C @ x).real + D*u)(inner_states, x)
-
-    deter = inner_states
-
-    return y, y
-
-
 
 
 
@@ -326,7 +247,45 @@ class RSSM(nj.Module):
     deter = update * cand + (1 - update) * deter                              # (B, 512)
     return deter, deter
 
+  ####################################################
+  # From the Resurrecting Recurrent Neural Networks work
+  ####################################################
+  def _lru(self, x, deter, lru_params):
 
+    # Extract out SSM parameters
+    nu_log, theta_log, B_re, B_im, C_re, C_im, D, gamma_log = lru_params
+
+    # Reconstruct diagonal lambda from nu_log and theta_log
+    Lambda = jnp.exp(-jnp.exp(nu_log) + 1j*jnp.exp(theta_log))                # (Sec 3.3) Enforcing Stability
+
+    # Materialize projections
+    gamma = jnp.expand_dims(jnp.exp(gamma_log), axis=-1)
+    B_norm = (B_re + 1j*B_im) * gamma                                         # (Eq 7) Norm Factor
+    C = C_re + 1j*C_im
+
+    # Expand Lambda to match batch size
+    Lambda = jnp.repeat(Lambda[None, ...], x.shape[0], axis=0)
+    # First term of Eq 7
+    '''
+    print(f'Lamba shape {Lambda.shape}')
+    print(f' deter shape {deter.shape}')
+    print(f' x shape {x.shape}[]')
+    Lambda_state_elements = jax.vmap(lambda x: Lambda @ x)(deter) 
+    '''
+    Lambda_state_elements = Lambda
+
+    # Second term of Eq 7
+    Bu_elements = jax.vmap(lambda u: B_norm @ u)(x)
+
+    # Parallel scan of linear recurrence 
+    elements = (Lambda_state_elements, Bu_elements)
+    _, inner_states = jax.lax.associative_scan(self._binary_operator_diag, elements)
+
+    y = jax.vmap(lambda x,u: (C @ x).real + D*u)(inner_states, x)
+
+    deter = inner_states
+
+    return y, y
 
 
 
