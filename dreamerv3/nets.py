@@ -60,7 +60,7 @@ class RSSM(nj.Module):
     post, prior = jaxutils.scan(step, inputs, start, self._unroll)
     post = {k: swap(v) for k, v in post.items()}
     prior = {k: swap(v) for k, v in prior.items()}
-    print(f'[*] OBSERVE TRAJECTORY Post keys {post.keys()}')
+    # print(f'[*] OBSERVE TRAJECTORY Post keys {post.keys()}')
     return post, prior
 
   def imagine(self, action, state=None):
@@ -70,7 +70,7 @@ class RSSM(nj.Module):
     action = swap(action)
     prior = jaxutils.scan(self.img_step, action, state, self._unroll)
     prior = {k: swap(v) for k, v in prior.items()}
-    print(f'[*] IMAGINE TRAJECTORY Prior keys {prior.keys()}')
+    # print(f'[*] IMAGINE TRAJECTORY Prior keys {prior.keys()}')
     return prior
 
   def get_dist(self, state, argmax=False):
@@ -100,8 +100,8 @@ class RSSM(nj.Module):
     dist = self.get_dist(stats)
     stoch = dist.sample(seed=nj.rng())
     post = {'stoch': stoch, 'deter': prior['deter'], **stats}
-    print(f'[*] OBSERVE STEP posterior stochastic shape {post["stoch"].shape}')
-    print(f'[*] OBSERVE STEP posterior deterministic shape {post["deter"].shape}')
+    # print(f'[*] OBSERVE STEP posterior stochastic shape {post["stoch"].shape}')
+    # print(f'[*] OBSERVE STEP posterior deterministic shape {post["deter"].shape}')
     return cast(post), cast(prior)
 
   def img_step(self, prev_state, prev_action):
@@ -124,8 +124,8 @@ class RSSM(nj.Module):
     dist = self.get_dist(stats)
     stoch = dist.sample(seed=nj.rng())
     prior = {'stoch': stoch, 'deter': deter, **stats}
-    print(f'[*] IMAGINE STEP prior stochastic shape {prior["stoch"].shape}')
-    print(f'[*] IMAGINE STEP prior deterministic shape {prior["deter"].shape}')
+    # print(f'[*] IMAGINE STEP prior stochastic shape {prior["stoch"].shape}')
+    # print(f'[*] IMAGINE STEP prior deterministic shape {prior["deter"].shape}')
     return cast(prior)
 
   def get_stoch(self, deter):
@@ -135,8 +135,8 @@ class RSSM(nj.Module):
     return cast(dist.mode())
 
   def _gru(self, x, deter):
-    print(f'[*] GRU Input x shape {x.shape}')
-    print(f'[*] GRU Input deter shape {deter.shape}')
+    # print(f'[*] GRU Input x shape {x.shape}')
+    # print(f'[*] GRU Input deter shape {deter.shape}')
     x = jnp.concatenate([deter, x], -1)
     kw = {**self._kw, 'act': 'none', 'units': 3 * self._deter}
     x = self.get('gru', Linear, **kw)(x)
@@ -145,7 +145,7 @@ class RSSM(nj.Module):
     cand = jnp.tanh(reset * cand)
     update = jax.nn.sigmoid(update - 1)
     deter = update * cand + (1 - update) * deter
-    print(f'[*] GRU output deterministic shape {deter.shape}')
+    # print(f'[*] GRU output deterministic shape {deter.shape}')
     return deter, deter
 
   def _stats(self, name, x):
@@ -211,8 +211,8 @@ class MultiEncoder(nj.Module):
     self.mlp_shapes = {k: v for k, v in shapes.items() if (
         len(v) in (1, 2) and re.match(mlp_keys, k))}
     self.shapes = {**self.cnn_shapes, **self.mlp_shapes}
-    print('Encoder CNN shapes:', self.cnn_shapes)
-    print('Encoder MLP shapes:', self.mlp_shapes)
+    # print('Encoder CNN shapes:', self.cnn_shapes)
+    # print('Encoder MLP shapes:', self.mlp_shapes)
     cnn_kw = {**kw, 'minres': minres, 'name': 'cnn'}
     mlp_kw = {**kw, 'symlog_inputs': symlog_inputs, 'name': 'mlp'}
     if cnn == 'resnet':
@@ -262,8 +262,8 @@ class MultiDecoder(nj.Module):
         k: v for k, v in shapes.items()
         if re.match(mlp_keys, k) and len(v) == 1}
     self.shapes = {**self.cnn_shapes, **self.mlp_shapes}
-    print('Decoder CNN shapes:', self.cnn_shapes)
-    print('Decoder MLP shapes:', self.mlp_shapes)
+    # print('Decoder CNN shapes:', self.cnn_shapes)
+    # print('Decoder MLP shapes:', self.mlp_shapes)
     cnn_kw = {**kw, 'minres': minres, 'sigmoid': cnn_sigmoid}
     mlp_kw = {**kw, 'dist': vector_dist, 'outscale': outscale, 'bins': bins}
     if self.cnn_shapes:

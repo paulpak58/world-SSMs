@@ -126,6 +126,9 @@ class RSSM(nj.Module):
 
 
 
+
+
+
   ######################################################################
   # Observation step uses the imagination step to retrieve the prior
   # and concatenates it with the current latent embedding to compute posterior

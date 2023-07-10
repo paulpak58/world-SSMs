@@ -10,17 +10,16 @@ source ${conda} wssm
 
 ####################### TEST LOG ###########################
 # logdir:
-#       - run_atari_lru: small lru [CUDA 0] 
-#       - run_atari_gru: small gru [CUDA 1]
+#       - run_lru_ssm_atari: small lru [CUDA 0] 
 #############################################################
-python ${home}/world-SSMs/main.py \
+python ${home}/world-SSMs/ssm_main.py \
     --configs atari small \
-    --logdir ${log}/run_atari_gru \
+    --logdir ${log}/run_lru_ssm_atari \
     --replay_size 1000000.0 \
     --replay_online False \
     --jax.platform gpu \
-    --jax.policy_devices 1 \
-    --jax.train_devices 1 \
+    --jax.policy_devices 0 \
+    --jax.train_devices 0 \
     --jax.prealloc False \
     --run.script train \
     --run.steps 1e6 \

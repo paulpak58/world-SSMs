@@ -15,9 +15,9 @@ logger.addFilter(CheckTypesFilter())
 from . import behaviors
 from . import jaxagent
 from . import jaxutils
-from . import nets
 from . import ninjax as nj
-from . import general_nets
+from . import lru_ssm
+from . import nets
 
 
 @jaxagent.Wrapper
@@ -118,7 +118,7 @@ class Agent(nj.Module):
 
 class WorldModel(nj.Module):
 
-  def __init__(self, obs_space, act_space, config, hidden='gru'):
+  def __init__(self, obs_space, act_space, config, hidden='lru'):
     self.obs_space = obs_space
     self.act_space = act_space['action']
     self.config = config
@@ -129,9 +129,10 @@ class WorldModel(nj.Module):
     # Default is gru hidden unit 
     self.hidden = hidden
     if hidden=='gru':
-      self.rssm = general_nets.RSSM(**config.rssm, hidden='gru', name='rssm')
+      self.rssm = nets.RSSM(**config.rssm, hidden='gru', name='rssm')
     elif hidden=='lru':
-      self.rssm = general_nets.RSSM(**config.rssm, hidden='lru', name='rssm')
+      print(f'[*] Initializing the Linear Recurrent Unit...')
+      self.rssm = lru_ssm.LRU_SSM(**config.rssm, name='rssm')
 
     self.heads = {
         'decoder': nets.MultiDecoder(shapes, **config.decoder, name='dec'),
