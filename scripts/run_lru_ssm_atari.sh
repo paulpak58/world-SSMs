@@ -15,7 +15,7 @@ source ${conda} wssm
 python ${home}/world-SSMs/ssm_main.py \
     --configs atari small \
     --logdir ${log}/run_lru_ssm_atari \
-    --replay_size 1000000.0 \
+    --replay_size 1e6 \
     --replay_online False \
     --jax.platform gpu \
     --jax.policy_devices 0 \
@@ -24,8 +24,8 @@ python ${home}/world-SSMs/ssm_main.py \
     --run.script train \
     --run.steps 1e6 \
     --run.eval_every 1e5 \
-    --batch_size 16 \
-    --imag_horizon 16
+    --batch_size 4 \
+    --imag_horizon 16 \
     # --run.train_ratio 32 \
 
     #--encoder.mlp_keys 'vector' \

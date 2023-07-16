@@ -478,6 +478,7 @@ class Dist(nj.Module):
     shape = self._shape
     if self._dist.endswith('_disc'):
       shape = (*self._shape, self._bins)
+    # print(f'[*] max of inputs {jax.device_get(np.max(inputs))}')
     out = self.get('out', Linear, int(np.prod(shape)), **kw)(inputs)
     out = out.reshape(inputs.shape[:-1] + shape).astype(f32)
     if self._dist in ('normal', 'trunc_normal'):

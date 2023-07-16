@@ -22,7 +22,7 @@ warnings.filterwarnings("ignore", category=jnp.ComplexWarning)
 
 
 
-class LRU_SSM(nj.Module):
+class S5_WM(nj.Module):
 
   def __init__(
       self, deter=1024, stoch=32, classes=32, unroll=False, initial='learned',

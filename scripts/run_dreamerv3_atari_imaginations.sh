@@ -26,7 +26,7 @@ python ${home}/world-SSMs/main.py \
     --jax.train_devices 2 \
     --jax.prealloc False \
     --run.script train \
-    --run.steps 5e6 \
+    --run.steps 1e6 \
     --run.eval_every 1e5 \
     --batch_size 16 \
     --imag_horizon 256
