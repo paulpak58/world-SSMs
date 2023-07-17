@@ -21,12 +21,196 @@ import warnings
 warnings.filterwarnings("ignore", category=jnp.ComplexWarning)
 
 
+#############################
+# HiPPO Initializer for S5
+#############################
+def _make_HiPPO(N):
+  # N is state size, Returns NxN LegS matrix
+  P = np.sqrt(1 + 2 * np.arange(N))
+  A = P[:, np.newaxis] * P[np.newaxis, :]
+  A = np.tril(A) - np.diag(np.arange(N))
+  return -A
+
+############################################
+# Creates NPLR Representation of HiPPO-LegS matrix
+############################################
+def _make_NPLR_HiPPO(N):
+  # N is the state size
+  hippo = make_HiPPO(N)
+  P = jnp.sqrt(jnp.arange(N) + 0.5)
+  B = jnp.sqrt(2*jnp.arange(N) + 1.0)
+  # (N, N) HiPPO LegS matrix, low-rank factor P, HiPPO input matrix B
+  return hippo, P, B
+
+############################################
+# Creates DPLR Representation of HiPPO-LegS matrix
+############################################
+def _make_DPLR_HiPPO(self,N):
+  # N is the state size
+  A, P, B = make_NPLR_HiPPO(N)
+  S = A + P[:, jnp.newaxis]*P[jnp.newaxis, :]
+  S_diag = jnp.diagonal(S)
+
+  Lambda_real = self.get('Lambda_real', jnp.zeros(), shape=(N,))
+  Lambda_real = jnp.mean(S_diag) + jnp.ones_like(S_diag)
+  self.put('Lambda_real', Lambda_real)
+
+  # Diagonalize S to V Lambda V^*, Returns eigenvalues and eigenvectors
+  Lambda_imag = self.get('Lambda_imag', jnp.zeros(), shape=(N,))
+  self.get('V', jnp.zeros(), shape=(N,N))
+  Lambda_imag, V = jnp.linalg.eigh(S*-1j)
+  self.put('Lambda_imag', Lambda_imag)
+  self.put('V', V)
+      
+
+  P = V.conj().T@P
+  B_orig = B
+  B = V.conj().T@B
+  # Eigenvalues Lambda, low-rank factor P, conjugated HiPPO input matrix B, eigenvectors V, original HiPPO input matrix B
+  return Lambda_real + 1j*Lambda_imag, P, B, V, B_orig
+
+
+############################
+# SSM Initilization helper
+############################
+def trunc_standard_normal(key, shape):
+    H, P, _ = shape
+    Cs = []
+    for i in range(H):
+        key, skey = jax.random.split(key)
+        # sample C matrix
+        C = jax.nn.initializers.lecun_normal()(skey, (1, P, 2))                                         
+        Cs.append(C)
+    # (H, P, 2)
+    return jnp.array(Cs)[:, 0]
+
+
+####################################
+# Discretization Initilization helper
+###################################
+def init_log_steps(key, input):
+    H, dt_min, dt_max = input
+    dt_min = 0.001 if dt_min is None else dt_min
+    dt_max = 0.1 if dt_max is None else dt_max
+    log_steps = []
+    for i in range(H):
+        key, skey = jax.random.split(key)
+        log_step = jax.random.uniform(skey, (1,))**(jnp.log(dt_max) - jnp.log(dt_min)) + jnp.log(dt_min)
+        log_steps.append(log_step)
+    # (H,)
+    return jnp.array(log_steps)
+
+#############################################
+# Discretize diagonalized, continuous-time SSM
+# using bilinear transform
+#############################################
+def discretize_bilinear(Lambda, B_tilde, Delta):
+    # Lambda: Diagonal state matrix (P,)
+    Identity = jnp.ones(Lambda.shape[0])
+    # B_tilde: Input matrix (P, H), Delta: Time step (P, )
+    BL = 1/(Identity-(Delta/2.0)*Lambda)
+    # Discretized diagonal state matrix (P, )
+    Lambda_bar = (Identity+(Delta/2.0)*Lambda)*BL
+    # Discretized input matrix (P, H)
+    B_bar = (BL*Delta)[..., None]*B_tilde
+    return Lambda_bar, B_bar
+
+
+#############################################
+# Discretize diagonalized, continuous-time SSM
+# using zero-order hold
+#############################################
+def discretize_zoh(Lambda, B_tilde, Delta):
+    # Lambda: Diagonal state matrix (P,)
+    Identity = jnp.ones(Lambda.shape[0])
+    # Lambda_bar: Discretized diagonal state matrix (P, )
+    Lambda_bar = jnp.exp(Delta*Lambda)
+    # B_bar: Discretized input matrix (P, H)
+    B_bar = (1/Lambda*(Lambda_bar-Identity))[..., None]*B_tilde
+    return Lambda_bar, B_bar
+
+
+#############################################
+# Binary operator for parallel scan of linear recurrence
+###############################################
+@jax.vmap
+def binary_operator(element_i, element_j):
+    # [(P,),(P,)], [(P,),(P,)]
+    a_i, bu_i = element_i
+    a_j, bu_j = element_j
+    # (A_out, Bu_out)
+    return a_i*a_j, a_j*bu_i + bu_j
+
+
+
+
+
+def s5_scan(self, input_sequence):
+  local_P = 2*self.P if self._conj_sym else self.P
+
+  # A: initialize diagonal state to state matrix Lambda (eigenvalues)
+  Lambda_re = self.get('Lambda_real')
+  Lambda_imag = self.get('Lambda_imag')
+  if self.clip_eigs:
+    Lambda = jnp.clip(Lambda_re, None, -1e-4) + 1j*Lambda_imag
+  else:
+    Lambda = Lambda_re + 1j*Lambda_imag
+
+  # B: input to state matrix
+  B = self.get('B', jax.nn.initializers.lecun_normal(), nj.rng(), (local_P, self.H))
+  B_tilde = B[..., 0] + 1j*B[..., 1]
+
+  # C: state to output matrix
+  if self.C_init=='trunc_standard_normal':
+    C = self.get('C', trunc_standard_normal, nj.rng(), (self.H, local_P, 2))
+  elif self.C_init=='lecun_normal':
+    C = self.get('C', jax.nn.initializers.lecun_normal(), nj.rng(), (self.H, local_P, 2))
+  elif self.C_init=='complex_normal':
+    C = self.get('C', jax.nn.initializers.normal(stddev=0.5**0.5), nj.rng(), (self.H, self.P, 2)) 
+  else:
+    raise NotImplementedError(f'C_init method {self.C_init} not implemented')
+  C_tilde = C[..., 0] + 1j*C[..., 1]
+
+  # D: feedback matrix
+  D = self.get('D', jax.nn.initializers.normal(stddev=1.0), nj.rng(), (self.H,))
+
+  # Learnable discretization timescale value
+  log_step = self.get('log_step', init_log_steps, (self.P, self.dt_min, self.dt_max))
+  step = self.step_rescale * jnp.exp(self.log_step[:, 0])
+
+  if self.discretization in ['zoh']:
+    Lambda_bar, B_bar = discretize_zoh(Lambda, B_tilde, step)
+  elif self.discretization in ['bilinear']:
+    self.Lambda_bar, self.B_bar = discretize_bilinear(self.Lambda, B_tilde, step)
+  else:
+    raise NotImplementedError(f'Discretization method {self.discretization} not implemented')
+  self.get('Lambda_bar', )
+  self.put('Lambda_bar', Lambda_bar)
+  self.put('B_bar', B_bar)
+
+  ##############
+  # Discretized diagonal state matrix (P,P), input_sequence: (L, H)
+  Lambda_bar = self.get('Lambda_bar')
+  B_bar = self.get('B_bar')
+  C = self.get('C')
+  Lambda_elements = Lambda_bar * jnp.ones((input_sequence.shape[0], Lambda_bar.shape[0]))
+  # B_bar: Discretized input matrix (P, H), C_tilde: Output matrix (H, P) or (2H, P)
+  Bu_elements = jax.vmap(lambda u: B_bar@u)(input_sequence)
+  _, xs = jax.lax.associative_scan(binary_operator, (Lambda_elements, Bu_elements))
+
+  C_tilde = C[..., 0] + 1j*C[..., 1]
+  if self._conj_sym:
+      return jax.vmap(lambda x: 2*(C_tilde@x).real)(xs)
+  else:
+      return jax.vmap(lambda x: (C_tilde@x).real)(xs) # (L,H)
+
 
 class S5_WM(nj.Module):
 
   def __init__(
       self, deter=1024, stoch=32, classes=32, unroll=False, initial='learned',
-      unimix=0.01, action_clip=1.0, hidden='lru', **kw):
+      unimix=0.01, action_clip=1.0, hidden='lru', conj_sym=True, ssm_size_base=256,
+      blocks=8, d_model=128, **kw):
     self._deter = deter
     self._stoch = stoch
     self._classes = classes
@@ -36,6 +220,17 @@ class S5_WM(nj.Module):
     self._action_clip = action_clip
     self._kw = kw
     self._hidden = hidden
+    # S5 specific parameters
+    self._conj_sym = conj_sym
+    block_size = int(ssm_size_base/blocks)
+    if self._conj_sym:
+      self.block_size = block_size//2
+      self.ssm_size = ssm_size_base//2
+    else:
+      self.block_size = block_size
+      self.ssm_size = ssm_size_base
+    self.d_model = d_model
+
 
   ########################################
   # Initial consistent with original RSSM
@@ -63,6 +258,57 @@ class S5_WM(nj.Module):
       raise NotImplementedError(self._initial)
 
 
+  ##############################
+  # Initialize complex matrices
+  ##############################
+  def initialize_matrices(self, bs):
+    H = self.d_model
+    P = self.ssm_size
+    local_P = 2*self.P if self._conj_sym else self.ssm_size
+
+    # A: initialize diagonal state to state matrix Lambda (eigenvalues)
+    Lambda_re = self.get('Lambda_real')
+    Lambda_imag = self.get('Lambda_imag')
+    if self.clip_eigs:
+      Lambda = jnp.clip(Lambda_re, None, -1e-4) + 1j*Lambda_imag
+    else:
+      Lambda = Lambda_re + 1j*Lambda_imag
+
+    # B: input to state matrix
+    B = self.get('B', jax.nn.initializers.lecun_normal(), nj.rng(), (local_P, self.H))
+    B_tilde = B[..., 0] + 1j*B[..., 1]
+
+    # C: state to output matrix
+    if self.C_init=='trunc_standard_normal':
+      C = self.get('C', trunc_standard_normal, nj.rng(), (self.H, local_P, 2))
+    elif self.C_init=='lecun_normal':
+      C = self.get('C', jax.nn.initializers.lecun_normal(), nj.rng(), (self.H, local_P, 2))
+    elif self.C_init=='complex_normal':
+      C = self.get('C', jax.nn.initializers.normal(stddev=0.5**0.5), nj.rng(), (self.H, self.P, 2)) 
+    else:
+      raise NotImplementedError(f'C_init method {self.C_init} not implemented')
+    C_tilde = C[..., 0] + 1j*C[..., 1]
+
+    # D: feedback matrix
+    D = self.get('D', jax.nn.initializers.normal(stddev=1.0), nj.rng(), (self.H,))
+
+    # Learnable discretization timescale value
+    log_step = self.get('log_step', init_log_steps, (self.P, self.dt_min, self.dt_max))
+    step = self.step_rescale * jnp.exp(self.log_step[:, 0])
+
+    if self.discretization in ['zoh']:
+      Lambda_bar, B_bar = discretize_zoh(Lambda, B_tilde, step)
+    elif self.discretization in ['bilinear']:
+      self.Lambda_bar, self.B_bar = discretize_bilinear(self.Lambda, B_tilde, step)
+    else:
+      raise NotImplementedError(f'Discretization method {self.discretization} not implemented')
+    self.get('Lambda_bar', )
+    self.put('Lambda_bar', Lambda_bar)
+    self.put('B_bar', B_bar)
+  
+
+
+
   #################################
   # Full observation parallel scan
   #################################
@@ -82,6 +328,13 @@ class S5_WM(nj.Module):
     post = {k: swap(v) for k, v in post.items()}
     prior = {k: swap(v) for k, v in prior.items()}
     return post, prior
+
+
+  def observe(self, embed, action, is_first, state=None):
+
+
+
+
 
 
   #################################
@@ -408,19 +661,19 @@ class LRU(nj.Module):
   def __call__(self, input, prev_state):
 
 
-    # [Lemma 3.2] Learnable parameters for diagonal Lambda
-    nu_log = self.get('nu_log', Nu_Log_Initializer(self.r_min, self.r_max), (self.N,))
-    theta_log = self.get('theta_log', Theta_Log_Initializer(self.max_phase), (self.N,))
-    # Glorot initialized input/output projection matrices
-    # B_re = self.get('B_re', B_Initializer, (self.N,self.H))
-    # B_im = self.get('B_im', B_Initializer, (self.N,self.H))
-    # C_re = self.get('C_re', C_Initializer, (self.H,self.N))
-    # C_im = self.get('C_im', C_Initializer, (self.H,self.N))
-    B_re = self.get('B_re', jax.nn.initializers.glorot_normal(), nj.rng(), (self.N,self.H))
-    B_im = self.get('B_im', jax.nn.initializers.glorot_normal(), nj.rng(), (self.N,self.H))
-    C_re = self.get('C_re', jax.nn.initializers.glorot_normal(), nj.rng(), (self.H,self.N))
-    C_im = self.get('C_im', jax.nn.initializers.glorot_normal(), nj.rng(), (self.H,self.N))
-    D = self.get('D', jax.nn.initializers.normal(), nj.rng(), (self.H,))
+    # [lemma 3.2] learnable parameters for diagonal lambda
+    nu_log = self.get('nu_log', nu_log_initializer(self.r_min, self.r_max), (self.n,))
+    theta_log = self.get('theta_log', theta_log_initializer(self.max_phase), (self.n,))
+    # glorot initialized input/output projection matrices
+    # b_re = self.get('b_re', b_initializer, (self.n,self.h))
+    # b_im = self.get('b_im', b_initializer, (self.n,self.h))
+    # c_re = self.get('c_re', c_initializer, (self.h,self.n))
+    # c_im = self.get('c_im', c_initializer, (self.h,self.n))
+    b_re = self.get('b_re', jax.nn.initializers.glorot_normal(), nj.rng(), (self.n,self.h))
+    b_im = self.get('b_im', jax.nn.initializers.glorot_normal(), nj.rng(), (self.n,self.h))
+    c_re = self.get('c_re', jax.nn.initializers.glorot_normal(), nj.rng(), (self.h,self.n))
+    c_im = self.get('c_im', jax.nn.initializers.glorot_normal(), nj.rng(), (self.h,self.n))
+    d = self.get('d', jax.nn.initializers.normal(), nj.rng(), (self.h,))
     # [Eq.7] Normalization factor that gets multiplied element-wise with Bu_{k}
     gamma_log = self.get('gamma_log', Gamma_Log_Initializer(nu_log, theta_log), (self.N,))
 
