@@ -1,5 +1,6 @@
-import re
+`import re
 from typing import Any
+import math
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -22,13 +23,24 @@ cast = jaxutils.cast_to_compute
 
 
 
+class MultiHeadEMA(nj.Module):
+  def __init__(
+      self, d_model, d_state=2, bidirectional=False, l_max=None
+  ):
+    self.H = d_model
+    self.N = d_state
+    self.bidirectional = bidirectional
+    self.l_max = l_max
+    self.scale = math.sqrt(1.0/self.N)
+
+
+
 
 class Mega_WM(nj.Module):
 
   def __init__(
       self, deter=1024, stoch=32, classes=32, unroll=False, initial='learned',
-      unimix=0.01, action_clip=1.0, hidden='lru', conj_sym=True, ssm_size_base=256,
-      blocks=8, d_model=128, **kw):
+      unimix=0.01, action_clip=1.0, d_model, d_attin, d_attout, d_state, **kw):
     self._deter = deter
     self._stoch = stoch
     self._classes = classes
@@ -37,19 +49,12 @@ class Mega_WM(nj.Module):
     self._unimix = unimix
     self._action_clip = action_clip
     self._kw = kw
-    self._hidden = hidden
-    # S5 specific parameters
-    self.conj_sym = conj_sym
-    block_size = int(ssm_size_base/blocks)
-    self.orig_block_size = block_size
-    if self.conj_sym:
-      self.block_size = block_size//2
-      self.ssm_size = ssm_size_base//2
-    else:
-      self.block_size = block_size
-      self.ssm_size = ssm_size_base
-    self.blocks = blocks
+    # Mega parameter
     self.d_model = d_model
+    self.d_attin = d_attin
+    self.d_attout = d_attout
+    self.d_state = d_state
+
 
 
   ########################################
@@ -94,9 +99,52 @@ class Mega_WM(nj.Module):
     # gamma & omega (C and D parameters) of unit variance
     gamma = self.get('gamma', jax.nn.initializers.normal(stddev=0.1), (self.ssm_size,))
     omega = self.get('omega', jax.nn.initializers.normal(stddev=0.1), (self.ssm_size,))
-
     ####### Linear layers #######
-    v_proj = self.get('v_proj', nets.Linear)
+    v_proj = self.get('v_proj', nets.Linear, (self.d_model, self.d_attout), bias=True)
+    mx_proj = self.get('mx_proj', nets.Linear, (self.d_model, self.d_attin+self.d_attout+2*self.d_model) bias=True)
+    h_proj = self.get('h_proj', nets.Linear, (self.d_attout, self.d_model) bias=True)
+
+
+  def element_attention(self, q, k, padding_mask, attn_mask, before_attn_fn):
+    slen = k.size(2)
+    if padding_mask is not None:
+      inverse_mask = 1.0-padding_mask.type_as(q)  # (B,K,C)
+      lengths = inverse_mask.sum(dim=-1, keepdim=True)  # (B,K,1)
+      lengths = lengths.clamp(min=1.0).unsqueeze(-1)  # (B,K,1,1)
+    else:
+      lengths = slen
+      inverse_mask = None
+    if attn_mask is not None:
+      lengths = attn_mask.sum(dim=-1, keepdim=True) # Cx1
+    # TODO
+
+
+  def forward_scan(
+    self,
+    x,
+    state = None,
+    padding_mask = None,
+    need_weights = False,
+    attn_mask = None,
+    before_attn_fn = False,
+    **kwargs
+  ):
+    # Input shape: (B, L, D)
+    if self.transposed: # TODO
+      x = x.transpose(-1,-2)
+    B,L,D = x.size()
+    assert D==self.d_model
+
+    residual = x
+    if self.prenorm:  # TODO
+      x = self.get('norm')(x)
+    v_proj = self.get('v_proj')(x)
+    v = self.get('activation')(v_proj)
+
+
+    mx, _ = self.ssm(x, state=state, padding_mask=padding_mask) # (B,L,D)
+      
+
 
 
 
@@ -331,4 +379,5 @@ class Mega_WM(nj.Module):
       raise NotImplementedError(impl)
     if free:
       loss = jnp.maximum(loss, free)
-    return loss
+    return loss``
+`

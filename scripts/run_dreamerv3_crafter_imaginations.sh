@@ -22,18 +22,18 @@ source ${conda} wssm
 #############################################################
 python ${home}/world-SSMs/main.py \
     --configs crafter small \
-    --logdir ${log}/run_crafter_small_imag_512 \
+    --logdir ${log}/run_crafter_small_imag_32 \
     --replay_size 1e6 \
     --replay_online False \
     --jax.platform gpu \
-    --jax.policy_devices 2 \
-    --jax.train_devices 2 \
+    --jax.policy_devices 1 \
+    --jax.train_devices 1 \
     --jax.prealloc False \
     --run.script train \
     --run.steps 1e6 \
     --run.eval_every 1e6 \
     --batch_size 16 \
-    --imag_horizon 512
+    --imag_horizon 32
     # --run.train_ratio 32 \
 
 
