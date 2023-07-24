@@ -3,37 +3,41 @@ import jax.numpy as jnp
 from s5_utils import make_DPLR_HiPPO, trunc_standard_normal
 
 
-########################
-# Initialize C_tilde=CV
-########################
-def CV_initializer(C_init, rng, shape, V):
-  if C_init=='trunc_standard_normal':
-    C_func = trunc_standard_normal(rng, shape)
-  elif C_init=='lecun_normal':
-    C_func = jax.nn.initializers.lecun_normal(rng, shape)
-  elif C_init=='complex_normal':
-    C_func = jax.nn.initializers.normal(stddev=0.5**0.5)(rng, shape)
-  else:
-    raise NotImplementedError(f'C_init method {C_init} not implemented')
-
-  if C_init=='complex_normal':
-    return C_func
-  else:
-    # Desired shape of matrix (H, P)
-    C = C_func[..., 0] + 1j*C_func[..., 1]
-    # V composes the eigenvectors of the diagonalized state matrix
-    CV = C@V
-    return jnp.concatenate([CV.real[..., None], CV.imag[..., None]], axis=-1) # (H, P, 2)
+#################################################
+# Initialize C_tilde=CV. First sample C, then compute CV
+#################################################
+def init_CV(init_fun, rng, shape, V):
+    C_ = init_fun(rng, shape)
+    C = C_[..., 0] + 1j * C_[..., 1]
+    CV = C @ V
+    # C_tilde (complex64) shape (H, P, 2)
+    return jnp.concatenate((CV.real[..., None], CV.imag[..., None]), axis=-1)
 
 
 ########################
 # Initialize VinvB=VinvB
 ########################
-def VinvB_initializer(rng, shape, Vinv):
+def init_VinvB(rng, shape, Vinv):
   # Desired shape of matrix (P, H)
   B = jax.nn.initializers.lecun_normal(rng, shape)
   Vinv = Vinv@B
   return jnp.concatenate([Vinv.real[..., None], Vinv.imag[..., None]], axis=-1)   # (P, H, 2)
+
+
+####################################
+# Discretization Initilization helper
+###################################
+def init_log_steps(key, input):
+  H, dt_min, dt_max = input
+  dt_min = 0.001 if dt_min is None else dt_min
+  dt_max = 0.1 if dt_max is None else dt_max
+  log_steps = []
+  for i in range(H):
+      key, skey = jax.random.split(key)
+      log_step = jax.random.uniform(skey, (1,))**(jnp.log(dt_max) - jnp.log(dt_min)) + jnp.log(dt_min)
+      log_steps.append(log_step)
+  # (H,)
+  return jnp.array(log_steps)
 
 
 ###################################################

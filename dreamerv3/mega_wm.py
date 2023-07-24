@@ -9,7 +9,7 @@ from tensorflow_probability.substrates import jax as tfp
 from . import jaxutils
 from . import ninjax as nj
 from . import nets
-from . import s5_utils
+from . import ssm_utils
 from s5_utils import discretize_bilinear, discretize_zoh, init_log_steps, \
                      trunc_standard_normal, make_DPLR_HiPPO, binary_operator
 from initializers import VinvB_initializer, CV_initializer, lambda_re_initializer, lambda_imag_initializer

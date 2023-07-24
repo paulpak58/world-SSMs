@@ -8,7 +8,7 @@ from tensorflow_probability.substrates import jax as tfp
 from . import jaxutils
 from . import ninjax as nj
 from . import nets
-from . import s5_utils
+from . import ssm_utils
 from s5_utils import discretize_bilinear, discretize_zoh, init_log_steps, \
                      trunc_standard_normal, make_DPLR_HiPPO, binary_operator
 from initializers import VinvB_initializer, CV_initializer, lambda_re_initializer, lambda_imag_initializer
@@ -79,37 +79,6 @@ class S5_WM(nj.Module):
 
 
 
-  ##############################
-  # Initialize complex matrices
-  ##############################
-  def initialize_matrices(self):
-    P = self.ssm_size
-    local_P = 2*P if self._conj_sym else self.ssm_size
-    # DPLR HiPPO representation
-    _, _, B, V, _ = make_DPLR_HiPPO(self.orig_block_size) # note: block size
-    V = V[:, :self.block_size]
-    Vc = V.conj().T
-    V, Vinv = block_diag(*([V]*self.blocks)), block_diag(*([Vc]*self.blocks))
-    self.B, self.V = B, V
-    # Initialize diagonal state to state matrix Lambda
-    Lambda_re = self.get('Lambda_real', lambda_re_initializer, (self.blocks, self.block_size))
-    Lambda_imag = self.get('Lambda_imag', lambda_imag_initializer, (self.blocks, self.block_size))
-    if self.clip_eigs:
-      self.Lambda = jnp.clip(Lambda_re, None, -1e-4) + 1j*Lambda_imag
-    else:
-      self.Lambda = Lambda_re + 1j*Lambda_imag
-    # Input to state matrix
-    self.B = self.get('B', VinvB_initializer, nj.rng(), (local_P, self.H), self.Vinv)
-    B_tilde = B[..., 0] + 1j*B[..., 1]
-    # Learnable discretization timescale value
-    log_step = self.get('log_step', init_log_steps, (P, self.dt_min, self.dt_max))
-    step = self.step_rescale * jnp.exp(log_step[:, 0])
-    if self.discretization=='zoh':
-      self.Lambda_bar, self.B_bar = discretize_zoh(self.Lambda, B_tilde, step)
-    elif self.discretization=='bilinear':
-      self.Lambda_bar, self.B_bar = discretize_bilinear(self.Lambda, B_tilde, step)
-    else:
-      raise NotImplementedError(f'Discretization method {self.discretization} not implemented')
 
   #####################################
   # S5 scan operates on (L,H) sequences
