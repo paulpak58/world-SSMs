@@ -34,13 +34,6 @@ class S4DLayer(nn.Module):
   imagine: bool=False
   clip_eigs: bool=False
   scaling: str='hippo'
-  lr = {
-    'A_re': 0.1,
-    'A_im': 0.1,
-    'B_re': 0.1,
-    'B_im': 0.1,
-    'log_step': 0.1
-  }
 
   def setup(self):
     if self.scaling=='hippo':

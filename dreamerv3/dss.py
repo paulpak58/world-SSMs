@@ -8,6 +8,17 @@ from discretization import discrete_dss_ssm
 from kernels import dss_kernel, causal_convolution
 from scan import scan_SSM
 
+###############################
+# Instantiates a single DSS layer
+###############################
+def DSSLayerInit(
+  Lambda_re_init, Lambda_im_init, P_init, B_init, N, l_max, imagine
+):
+  return partial(
+    DSSLayer, Lambda_re_init=Lambda_re_init, Lambda_im_init=Lambda_im_init,
+    P_init=P_init, B_init=B_init, N=N, l_max=l_max, imagine=imagine
+  )
+
 
 ###############################
 # Flax implementation of DSS Layer

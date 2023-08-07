@@ -25,17 +25,6 @@ def _make_NPLR_HiPPO(N):
   # (N, N) HiPPO LegS matrix, low-rank factor P, HiPPO input matrix B
   return hippo, P, B
 
-# Verify that this returns the same outputs as the implementation above
-def _make_S4_NPLR_HiPPO(N):
-   nhippo = _make_HiPPO(N)
-   # Add in rank 1 term
-   p = 0.5*jnp.sqrt(2*jnp.arange(1,N+1)+1.0)
-   q = 2*p
-   S = nhippo + p[:,jnp.newaxis] * q[jnp.newaxis,:]
-   # Diagonalize to S to V\LambdaV^*
-   Lambda, V = jax.jit(jnp.linalg.eig, backend='cpu')(S)
-   return nhippo, Lambda, p, q, V
-
 
 ############################################
 # Creates DPLR Representation of HiPPO-LegS matrix
