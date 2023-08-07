@@ -16,11 +16,11 @@ from initializers import init_VinvB, init_CV, mimo_log_step_initializer, trunc_s
 # Instantiates a single S5 layer
 ###############################
 def S5LayerInit(
-  H, P, Lambda_re_init, Lambda_imag_init, V, Vinv, C_init, discretization, dt_min, dt_max, conj_sym, clip_eigs, bidirectional
+  H, P, Lambda_re_init, Lambda_im_init, V, Vinv, C_init, discretization, dt_min, dt_max, conj_sym, clip_eigs, bidirectional
 ):
   # H=d_model, P=ssm_size
   return partial(
-    S5Layer, H=H, P=P, Lambda_re_init=Lambda_re_init, Lambda_im_init=Lambda_imag_init,
+    S5Layer, H=H, P=P, Lambda_re_init=Lambda_re_init, Lambda_im_init=Lambda_im_init,
     V=V, Vinv=Vinv, C_init=C_init, discretization=discretization, dt_min=dt_min, dt_max=dt_max,\
     conj_sym=conj_sym, clip_eigs=clip_eigs, bidirectional=bidirectional
   )

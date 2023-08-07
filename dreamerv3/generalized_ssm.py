@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import ninjax as nj
 from flax import linen as nn
 from functools import partial
 
@@ -15,27 +16,19 @@ SSM_MODELS = {
 }
 
 
-def build_ssm(ssm):
+def build_ssm(config):
 
-  if ssm.model=='s5':
+  if config.ssm =='s5':
 
-    ssm_size = ssm.ssm_size_base
+    ssm_size = config.s5.ssm_size
+    block_size = int(ssm_size/config.s5.blocks)  # size of initial blocks
+    # padded = False
+    # in_dim = config.embed_dim
+    # train_size = config.train_size
 
-    # size of the initial blocks
-    block_size = int(ssm_size/ssm.blocks)
-    
-    padded = False
-    retrieval = False
-    speech = False
-
-    n_classes = 0
-    seq_len = ssm.seq_len
-    in_dim = ssm.embed_dim
-    train_size = ssm.train_size
-
+    # Initialize DPLR HiPPO matrix
     Lambda, _, B, V, B_orig = make_DPLR_HiPPO(block_size)
-    # Using conjugate pairs halves the size of the state space
-    if ssm.conj_sym:
+    if config.s5.conj_sym: # conj. pairs halve the state space
       block_size = block_size//2
       ssm_size = ssm_size//2
     Lambda = Lambda[:block_size]
@@ -43,44 +36,46 @@ def build_ssm(ssm):
     Vc = V.conj().T
 
     # Put each HiPPO on each block diagonal
-    Lambda = (Lambda * jnp.ones((ssm.blocks, block_size))).ravel()
-    V = jax.scipy.linalg.block_diag(*[V]*ssm.blocks)
-    Vinv = jax.scipy.linalg.block_diag(*[Vc]*ssm.blocks)
-
-    init_fn = SSM_MODELS[ssm.model](
-      H=ssm.d_model, P=ssm.ssm_size, Lambda_re_init=Lambda.real, Lambda_im_init=Lambda.imag,
-      V=V, Vinv=Vinv, C_init=ssm.C_init, discretization=ssm.discretization, dt_min=ssm.dt_min,
-      dt_max=ssm.dt_max, conj_sym=ssm.conj_sym, clip_eigs=ssm.clip_eigs, bidirectional=ssm.bidirectional,
+    Lambda = (Lambda * jnp.ones((config.s5.blocks, block_size))).ravel()
+    V = jax.scipy.linalg.block_diag(*[V]*config.s5.blocks)
+    Vinv = jax.scipy.linalg.block_diag(*[Vc]*config.s5.blocks)
+    # Initializes the SSM layer
+    init_fn = SSM_MODELS[config.ssm](
+      H=config.s5.d_model, P=config.s5.ssm_size, Lambda_re_init=Lambda.real, Lambda_im_init=Lambda.imag,
+      V=V, Vinv=Vinv, C_init=config.s5.C_init, discretization=config.s5.discretization, dt_min=config.s5.dt_min,
+      dt_max=config.s5.dt_max, conj_sym=config.s5.conj_sym, clip_eigs=config.s5.clip_eigs, bidirectional=config.s5.bidirectional,
     )
+    # Creates full batched model based on the SSM layer
     model = partial(
       BatchedSequenceModel,
       ssm=init_fn,
-      d_output=n_classes, #TODO
-      d_model=ssm.d_model,
-      n_layers=ssm.n_layers,
-      padded=padded,
-      activation=ssm.activation,
-      dropout=ssm.p_dropout,
-      prenorm=ssm.prenorm,
-      batchnorm=ssm.batchnorm,
-      bn_momentum=ssm.bn_momentum
+      d_output=config.s5.seq_len, #TODO
+      d_model=config.s5.d_model,
+      n_layers=config.s5.n_layers,
+      activation=config.s5.act,
+      dropout=config.s5.dropout,
+      prenorm=config.s5.prenorm,
+      batchnorm=config.s5.batchnorm,
+      bn_momentum=config.s5.bn_momentum
     )
+    nj_model = FlaxNinjaxWrapper(model, name='s5')
 
-
-  elif ssm.model=='s4':
+  elif config.ssm=='s4':
     raise NotImplementedError
-  elif ssm.model=='s4d':
+  elif config.ssm=='s4d':
     raise NotImplementedError
-  elif ssm.model=='dss':
+  elif config.ssm=='dss':
     raise NotImplementedError
-  elif ssm.model=='liquid':
+  elif config.ssm=='liquid':
     raise NotImplementedError
-  elif ssm.model=='lru':
+  elif config.ssm=='lru':
     raise NotImplementedError
-  elif ssm.model=='mega':
+  elif config.ssm=='mega':
     raise NotImplementedError
   else:
     raise NotImplementedError
+  print('Done')
+  raise Exception('ckpt')
 
 
 ########################################
@@ -96,7 +91,7 @@ def masked_meanpool(x, lengths):
 # Full Sequence Layer that includes the SSM, Norm,
 # Dropout, and Nonlinearity
 ##############################################
-class SequenceLayer(nn.Module):
+class GeneralSequenceLayer(nn.Module):
   ssm: nn.Module
   dropout: float
   d_model: int
@@ -157,7 +152,7 @@ class SequenceLayer(nn.Module):
 #############################################
 # Stacked Encoder Model as implemented by
 #############################################
-class StackedSequenceModel(nn.Module):
+class GeneralSequenceModel(nn.Module):
   ssm: nn.Module
   d_output: int
   d_model: int
@@ -165,7 +160,7 @@ class StackedSequenceModel(nn.Module):
   activation: str='gelu'
   dropout: float=0.0
   training: bool=True
-  mode: str='pool'
+  mode: str=''
   prenorm: bool=False
   batchnorm: bool=False
   bn_momentum: float=0.9
@@ -175,7 +170,7 @@ class StackedSequenceModel(nn.Module):
     # Initializes linear encoder and stack of S5 layers
     self.encoder = nn.Dense(self.d_model)
     self.layers = [
-      SequenceLayer(
+      GeneralSequenceLayer(
         ssm=self.ssm,
         dropout=self.dropout,
         d_model=self.d_model,
@@ -196,12 +191,12 @@ class StackedSequenceModel(nn.Module):
     x = self.encoder(x)
     for l in self.layers:
       x = l(x)
-    if self.model in ['pool']:
+    if self.mode in ['pool']:
       if self.padded:
         x = masked_meanpool(x, length)
       else:
         x = jnp.mean(x, axis=0)
-    elif self.model in ['last']:
+    elif self.mode in ['last']:
       if self.padded:
         raise NotImplementedError(f'Mode must be in pool for self.padded=True')
       else:
@@ -218,7 +213,7 @@ class StackedSequenceModel(nn.Module):
 # Final batched version to use in the pipeline
 ############################################
 BatchedSequenceModel= nn.vmap(
-  StackedSequenceModel,
+  GeneralSequenceModel,
   in_axes=(0, 0),
   out_axes=0,
   variable_axes={'params':None, 'dropout':None, 'batch_stats':None, 'cache':0, 'prime':None},
@@ -227,6 +222,18 @@ BatchedSequenceModel= nn.vmap(
 )
 
 
+############################################
+# Ninjax wrapper allows us to pass state handling
+# directly into our ninjax optimizer
+############################################
+class FlaxNinjaxWrapper(nj.Module):
+  def __init__(self, flax_module: nn.Module):
+    self.flax_module = flax_module
+    self.ninjax_module = nj.FlaxModule(flax_module, name='flax_s5')
+
+  def __call__(self, x):
+    x = self.ninjax_module(x)
 
 
-
+if __name__=='__main__':
+  raise NotImplementedError
