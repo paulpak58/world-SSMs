@@ -14,8 +14,6 @@ from functools import partial
 from importlib import import_module
 import pathlib
 
-from dreamerv3.generalized_ssm import build_ssm
-
 
 directory = pathlib.Path(__file__).resolve()
 directory = directory.parent
@@ -165,9 +163,6 @@ def main(argv=None):
 	config.save(logdir/'config.yaml')
 	step = embodied.Counter()
 	logger = make_logger(parsed, logdir, step, config)
-
-	if config.ssm is not None:
-		build_ssm(config=config)
 
 
 	cleanup = []

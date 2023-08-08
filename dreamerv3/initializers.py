@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+from jax import random
 
 
 ############################
@@ -48,15 +49,15 @@ def make_DPLR_HiPPO(N):
 # SSM Initilization helper
 ############################
 def trunc_standard_normal(key, shape):
-    H, P, _ = shape
-    Cs = []
-    for i in range(H):
-        key, skey = random.split(key)
-        # sample C matrix
-        C = lecun_normal()(skey, (1, P, 2))                                         
-        Cs.append(C)
-    # (H, P, 2)
-    return jnp.array(Cs)[:, 0]
+  H, P, _ = shape
+  Cs = []
+  for i in range(H):
+      key, skey = random.split(key)
+      # sample C matrix
+      C = jax.nn.initializers.lecun_normal()(skey, (1, P, 2))                                         
+      Cs.append(C)
+  # (H, P, 2)
+  return jnp.array(Cs)[:, 0]
 
 
 
@@ -65,19 +66,20 @@ def trunc_standard_normal(key, shape):
 # Initialize C_tilde=CV. First sample C, then compute CV
 #################################################
 def init_CV(init_fun, rng, shape, V):
-    C_ = init_fun(rng, shape)
-    C = C_[..., 0] + 1j * C_[..., 1]
-    CV = C @ V
-    # C_tilde (complex64) shape (H, P, 2)
-    return jnp.concatenate((CV.real[..., None], CV.imag[..., None]), axis=-1)
+  C_ = init_fun(rng, shape)
+  C = C_[..., 0] + 1j * C_[..., 1]
+  CV = C @ V
+  # C_tilde (complex64) shape (H, P, 2)
+  return jnp.concatenate((CV.real[..., None], CV.imag[..., None]), axis=-1)
 
 
 ########################
 # Initialize VinvB=VinvB
 ########################
-def init_VinvB(rng, shape, Vinv):
+def init_VinvB(init_fn, rng, shape, Vinv):
   # Desired shape of matrix (P, H)
-  B = jax.nn.initializers.lecun_normal(rng, shape)
+  # B = jax.nn.initializers.lecun_normal(rng, shape)
+  B = init_fn(rng, shape)
   Vinv = Vinv@B
   return jnp.concatenate([Vinv.real[..., None], Vinv.imag[..., None]], axis=-1)   # (P, H, 2)
 

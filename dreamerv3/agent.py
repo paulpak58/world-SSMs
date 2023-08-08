@@ -17,6 +17,7 @@ from . import jaxagent
 from . import jaxutils
 from . import nets
 from . import ninjax as nj
+from . import generalized_ssm
 
 
 @jaxagent.Wrapper
@@ -124,7 +125,11 @@ class WorldModel(nj.Module):
     shapes = {k: tuple(v.shape) for k, v in obs_space.items()}
     shapes = {k: v for k, v in shapes.items() if not k.startswith('log_')}
     self.encoder = nets.MultiEncoder(shapes, **config.encoder, name='enc')
-    self.rssm = nets.RSSM(**config.rssm, name='rssm')
+    print(config.ssm)
+    if config.ssm=='s5':  # set true to use deep-ssm backbone
+      self.rssm = generalized_ssm.General_RSSM(**config.s5, **config.rssm, name='rssm')
+    else: 
+      self.rssm = nets.RSSM(**config.rssm, name='rssm')
     self.heads = {
         'decoder': nets.MultiDecoder(shapes, **config.decoder, name='dec'),
         'reward': nets.MLP((), **config.reward_head, name='rew'),

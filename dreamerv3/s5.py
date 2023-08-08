@@ -106,6 +106,7 @@ class S5Layer(nn.Module):
 
 
   def __call__(self, input_sequence):
+    print(f'shape of input sequence: {input_sequence.shape}')
     ys = apply_ssm(self.Lambda_bar, self.B_bar, self.C_tilde, input_sequence, self.conj_sym, self.bidirectional)
     Du = jax.vmap(lambda u: self.D*u)(input_sequence)
     return ys + Du

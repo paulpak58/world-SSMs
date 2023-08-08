@@ -1,13 +1,25 @@
 import jax
 import jax.numpy as jnp
-import ninjax as nj
+import numpy as np
 from flax import linen as nn
 from functools import partial
+from tensorflow_probability.substrates import jax as tfp
+
+from . import jaxutils
+from . import ninjax as nj
+from . import nets
 
 from initializers import make_DPLR_HiPPO
 from s5 import S5LayerInit
 from s4 import S4LayerInit
 from dss import DSSLayerInit
+
+f32 = jnp.float32
+tfd = tfp.distributions
+tree_map = jax.tree_util.tree_map
+sg = lambda x: tree_map(jax.lax.stop_gradient, x)
+cast = jaxutils.cast_to_compute
+Linear = nets.Linear
 
 SSM_MODELS = {
   's4': S4LayerInit,
@@ -58,7 +70,7 @@ def build_ssm(config):
       batchnorm=config.s5.batchnorm,
       bn_momentum=config.s5.bn_momentum
     )
-    nj_model = FlaxNinjaxWrapper(model, name='s5')
+    ssm = General_RSSM(model, name='s5')
 
   elif config.ssm=='s4':
     raise NotImplementedError
@@ -74,9 +86,8 @@ def build_ssm(config):
     raise NotImplementedError
   else:
     raise NotImplementedError
-  print('Done')
-  raise Exception('ckpt')
 
+  return ssm  
 
 ########################################
 # Masked meanpool used for pooling output
@@ -115,7 +126,7 @@ class GeneralSequenceLayer(nn.Module):
       self.norm = nn.LayerNorm()
     self.drop = nn.Dropout(
       self.dropout,
-      broadcast_dim=[0],
+      broadcast_dims=[0],
       deterministic=not self.training
     )
 
@@ -146,6 +157,54 @@ class GeneralSequenceLayer(nn.Module):
     if not self.prenorm:
       x = self.norm(x)
     return x
+
+
+##############################
+# Stacked Deep SSM Layers
+# Implemented in ninjax
+##############################
+class StackedSSM(nj.Module):
+    
+    def __init__(
+      self, init_fn, n_layers, dropout, d_model, act, prenorm, batchnorm, bn_momentum
+    ):
+      seq_layer = GeneralSequenceLayer(
+        ssm=init_fn, dropout=dropout, d_model=d_model, activation=act,
+        prenorm=prenorm, batchnorm=batchnorm, bn_momentum=bn_momentum,
+      )
+      self.n_layers = n_layers
+      # ssm layer attributes
+      self.init_fn = init_fn
+      self.dropout = dropout
+      self.d_model = d_model
+      self.act = act
+      self.prenorm = prenorm
+      self.batchnorm = batchnorm
+      self.bn_momentum = bn_momentum
+
+
+    def __call__(self, x, deter):
+      x = jnp.concatenate([deter, x], -1)
+      for l in range(self.n_layers):
+        x = nj.FlaxModule(
+          GeneralSequenceLayer, ssm=self.init_fn, dropout=self.dropout, d_model=self.d_model, activation=self.act,
+          prenorm=self.prenorm, batchnorm=self.batchnorm, bn_momentum=self.bn_momentum,
+          name=f'layer_{l}'
+        )(x)
+        x = nj.FlaxModule(
+          BatchedSequenceLayer, ssm=self.init_fn, dropout=self.dropout, d_model=self.d_model, activation=self.act,
+          prenorm=self.prenorm, batchnorm=self.batchnorm, bn_momentum=self.bn_momentum,
+          name=f'layer_{l}'
+        )(x)
+      print(f'x shape {x.shape}')
+      # for l in range(self.n_layers):
+      #   x = self.get(f'layer_{l}', nj.FlaxModule(self.ssm))(x)
+      #   # x = nj.FlaxModule(self.ssm, x, name=f'layer_{l}')
+      #   # x = self.ssm(x)
+      #   x = 
+      print(f'x shape {x.shape}')
+      raise Exception('c')
+      return x
 
 
 
@@ -206,7 +265,6 @@ class GeneralSequenceModel(nn.Module):
     x = self.decoder(x)
     x = nn.log_softmax(x, axis=-1)
     return x
-  
 
 
 ############################################
@@ -221,19 +279,252 @@ BatchedSequenceModel= nn.vmap(
   axis_name='batch'
 )
 
-
-############################################
-# Ninjax wrapper allows us to pass state handling
-# directly into our ninjax optimizer
-############################################
-class FlaxNinjaxWrapper(nj.Module):
-  def __init__(self, flax_module: nn.Module):
-    self.flax_module = flax_module
-    self.ninjax_module = nj.FlaxModule(flax_module, name='flax_s5')
-
-  def __call__(self, x):
-    x = self.ninjax_module(x)
+BatchedSequenceLayer = nn.vmap(
+  GeneralSequenceLayer,
+  in_axes=(0, 0),
+  out_axes=0,
+  variable_axes={'params':None, 'dropout':None, 'batch_stats':None, 'cache':0, 'prime':None},
+  split_rngs={'params': False, 'dropout': True},
+  axis_name='batch'
+)
 
 
-if __name__=='__main__':
-  raise NotImplementedError
+
+#################################################
+# General-RSSM Model using Deep State-Space Layers
+# Implemented with ninjax
+#################################################
+class General_RSSM(nj.Module):
+  def __init__(
+    self, ssm_size, blocks, d_model, n_layers, ssm_post_act, discretization,
+    dt_min, dt_max, conj_sym, clip_eigs, bidirectional, C_init,
+    dropout, prenorm, batchnorm, bn_momentum, 
+    deter=1024, stoch=32, classes=32, unroll=False,
+    initial='learned', unimix=0.01, action_clip=1.0, **kw
+  ):
+    self._deter = deter
+    self._stoch = stoch
+    self._classes = classes
+    self._unroll = unroll
+    self._initial = initial
+    self._unimix = unimix
+    self._action_clip = action_clip
+    self._kw = kw
+
+    # self.ssm = nj.FlaxModule(ssm, name='ssm')
+    self.ssm = 's5'
+    self.n_layers = n_layers
+    self.ssm_size = ssm_size
+    self.blocks = blocks
+    self.block_size = int(self.ssm_size/self.blocks)
+    self.d_model = d_model
+
+    self.dt_min = dt_min
+    self.dt_max = dt_max
+    self.conj_sym = conj_sym
+    self.clip_eigs = clip_eigs
+    self.bidirectional = bidirectional
+    self.C_init = C_init
+    self.discretization = discretization
+
+    self.act = ssm_post_act
+    self.dropout = dropout
+    self.prenorm = prenorm
+    self.batchnorm = batchnorm
+    self.bn_momentum = bn_momentum
+
+  def init_ssm(self, bs):
+
+    # Initialize DPLR HiPPO matrix
+    Lambda, _, B, V, B_orig = make_DPLR_HiPPO(self.block_size)
+    if self.conj_sym: # conj. pairs halve the state space
+      self.block_size = self.block_size//2
+      self.ssm_size = self.ssm_size//2
+    Lambda = Lambda[:self.block_size]
+    V = V[:, :self.block_size]
+    Vc = V.conj().T
+
+    # Put each HiPPO on each block diagonal
+    Lambda = (Lambda * jnp.ones((self.blocks, self.block_size))).ravel()
+    V = jax.scipy.linalg.block_diag(*[V]*self.blocks)
+    Vinv = jax.scipy.linalg.block_diag(*[Vc]*self.blocks)
+    # Initializes the SSM layer
+    self.init_fn = SSM_MODELS[self.ssm](
+      H=self.d_model, P=self.ssm_size, Lambda_re_init=Lambda.real, Lambda_im_init=Lambda.imag,
+      V=V, Vinv=Vinv, C_init=self.C_init, discretization=self.discretization, dt_min=self.dt_min,
+      dt_max=self.dt_max, conj_sym=self.conj_sym, clip_eigs=self.clip_eigs, bidirectional=self.bidirectional,
+    )
+
+  def initial(self, bs):
+    # Initialize the ssm
+    self.init_ssm(bs)
+
+    # Define the initial state                
+    if self._classes:
+      state = dict(
+          deter=jnp.zeros([bs, self._deter], f32),
+          logit=jnp.zeros([bs, self._stoch, self._classes], f32),
+          stoch=jnp.zeros([bs, self._stoch, self._classes], f32))
+    else:
+      state = dict(
+          deter=jnp.zeros([bs, self._deter], f32),
+          mean=jnp.zeros([bs, self._stoch], f32),
+          std=jnp.ones([bs, self._stoch], f32),
+          stoch=jnp.zeros([bs, self._stoch], f32))
+    if self._initial == 'zeros':
+      return cast(state)
+    elif self._initial == 'learned':
+      deter = self.get('initial', jnp.zeros, state['deter'][0].shape, f32)
+      state['deter'] = jnp.repeat(jnp.tanh(deter)[None], bs, 0)
+      state['stoch'] = self.get_stoch(cast(state['deter']))
+      return cast(state)
+    else:
+      raise NotImplementedError(self._initial)
+
+  def observe(self, embed, action, is_first, state=None):
+    swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
+    if state is None:
+      state = self.initial(action.shape[0])
+    step = lambda prev, inputs: self.obs_step(prev[0], *inputs)
+    inputs = swap(action), swap(embed), swap(is_first)
+    start = state, state
+    post, prior = jaxutils.scan(step, inputs, start, self._unroll)
+    post = {k: swap(v) for k, v in post.items()}
+    prior = {k: swap(v) for k, v in prior.items()}
+    # print(f'[*] OBSERVE TRAJECTORY Post keys {post.keys()}')
+    return post, prior
+
+  
+
+  def imagine(self, action, state=None):
+    swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
+    state = self.initial(action.shape[0]) if state is None else state
+    assert isinstance(state, dict), state
+    action = swap(action)
+    prior = jaxutils.scan(self.img_step, action, state, self._unroll)
+    prior = {k: swap(v) for k, v in prior.items()}
+    # print(f'[*] IMAGINE TRAJECTORY Prior keys {prior.keys()}')
+    return prior
+  
+
+  def obs_step(self, prev_state, prev_action, embed, is_first):
+    is_first = cast(is_first)
+    prev_action = cast(prev_action)
+    if self._action_clip > 0.0:
+      prev_action *= sg(self._action_clip / jnp.maximum(
+          self._action_clip, jnp.abs(prev_action)))
+    prev_state, prev_action = jax.tree_util.tree_map(
+        lambda x: self._mask(x, 1.0 - is_first), (prev_state, prev_action))
+    prev_state = jax.tree_util.tree_map(
+        lambda x, y: x + self._mask(y, is_first),
+        prev_state, self.initial(len(is_first)))
+    prior = self.img_step(prev_state, prev_action)
+    x = jnp.concatenate([prior['deter'], embed], -1)
+    x = self.get('obs_out', Linear, **self._kw)(x)
+    stats = self._stats('obs_stats', x)
+    dist = self.get_dist(stats)
+    stoch = dist.sample(seed=nj.rng())
+    post = {'stoch': stoch, 'deter': prior['deter'], **stats}
+    # print(f'[*] OBSERVE STEP posterior stochastic shape {post["stoch"].shape}')
+    # print(f'[*] OBSERVE STEP posterior deterministic shape {post["deter"].shape}')
+    return cast(post), cast(prior)
+  
+
+  def img_step(self, prev_state, prev_action):
+    prev_stoch = prev_state['stoch']
+    prev_action = cast(prev_action)
+    if self._action_clip > 0.0:
+      prev_action *= sg(self._action_clip / jnp.maximum(
+          self._action_clip, jnp.abs(prev_action)))
+    if self._classes:
+      shape = prev_stoch.shape[:-2] + (self._stoch * self._classes,)
+      prev_stoch = prev_stoch.reshape(shape)
+    if len(prev_action.shape) > len(prev_stoch.shape):  # 2D actions.
+      shape = prev_action.shape[:-2] + (np.prod(prev_action.shape[-2:]),)
+      prev_action = prev_action.reshape(shape)
+    x = jnp.concatenate([prev_stoch, prev_action], -1)
+    x = self.get('img_in', Linear, **self._kw)(x)
+    ssm_args = {
+      'init_fn': self.init_fn, 'n_layers': self.n_layers, 'dropout': self.dropout, 'd_model': self.d_model,
+      'act': self.act, 'prenorm': self.prenorm, 'batchnorm': self.batchnorm, 'bn_momentum': self.bn_momentum
+    }
+    x = self.get('ssm', StackedSSM, **ssm_args)(x, prev_state['deter'])
+    # x, deter = self._gru(x, prev_state['deter'])
+    print(f'x shape {x.shape}')
+    x = self.get('img_out', Linear, **self._kw)(x)
+    raise Exception('ckpt')
+  
+
+    stats = self._stats('img_stats', x)
+    dist = self.get_dist(stats)
+    stoch = dist.sample(seed=nj.rng())
+    prior = {'stoch': stoch, 'deter': deter, **stats}
+    # print(f'[*] IMAGINE STEP prior stochastic shape {prior["stoch"].shape}')
+    # print(f'[*] IMAGINE STEP prior deterministic shape {prior["deter"].shape}')
+    return cast(prior)
+  
+
+  def get_dist(self, state, argmax=False):
+    if self._classes:
+      logit = state['logit'].astype(f32)
+      return tfd.Independent(jaxutils.OneHotDist(logit), 1)
+    else:
+      mean = state['mean'].astype(f32)
+      std = state['std'].astype(f32)
+      return tfd.MultivariateNormalDiag(mean, std)
+
+
+  def get_stoch(self, deter):
+    x = self.get('img_out', Linear, **self._kw)(deter)
+    stats = self._stats('img_stats', x)
+    dist = self.get_dist(stats)
+    return cast(dist.mode())
+  
+
+  def _stats(self, name, x):
+    if self._classes:
+      x = self.get(name, Linear, self._stoch * self._classes)(x)
+      logit = x.reshape(x.shape[:-1] + (self._stoch, self._classes))
+      if self._unimix:
+        probs = jax.nn.softmax(logit, -1)
+        uniform = jnp.ones_like(probs) / probs.shape[-1]
+        probs = (1 - self._unimix) * probs + self._unimix * uniform
+        logit = jnp.log(probs)
+      stats = {'logit': logit}
+      return stats
+    else:
+      x = self.get(name, Linear, 2 * self._stoch)(x)
+      mean, std = jnp.split(x, 2, -1)
+      std = 2 * jax.nn.sigmoid(std / 2) + 0.1
+      return {'mean': mean, 'std': std}
+
+  def _mask(self, value, mask):
+    return jnp.einsum('b...,b->b...', value, mask.astype(value.dtype))
+
+  def dyn_loss(self, post, prior, impl='kl', free=1.0):
+    if impl == 'kl':
+      loss = self.get_dist(sg(post)).kl_divergence(self.get_dist(prior))
+    elif impl == 'logprob':
+      loss = -self.get_dist(prior).log_prob(sg(post['stoch']))
+    else:
+      raise NotImplementedError(impl)
+    if free:
+      loss = jnp.maximum(loss, free)
+    return loss
+
+  def rep_loss(self, post, prior, impl='kl', free=1.0):
+    if impl == 'kl':
+      loss = self.get_dist(post).kl_divergence(self.get_dist(sg(prior)))
+    elif impl == 'uniform':
+      uniform = jax.tree_util.tree_map(lambda x: jnp.zeros_like(x), prior)
+      loss = self.get_dist(post).kl_divergence(self.get_dist(uniform))
+    elif impl == 'entropy':
+      loss = -self.get_dist(post).entropy()
+    elif impl == 'none':
+      loss = jnp.zeros(post['deter'].shape[:-1])
+    else:
+      raise NotImplementedError(impl)
+    if free:
+      loss = jnp.maximum(loss, free)
+    return loss
+  

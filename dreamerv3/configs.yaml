@@ -103,14 +103,14 @@ defaults:
 
 
   # ssm configs
-  ssm: None
+  ssm: ''
   s5:
     ssm_size: 256  # ssm latent size (P)
-    seq_len: 64 
+    # seq_len: 64 
     blocks: 8
     d_model: 128  # number of features
     n_layers: 6  # number of ssm layers
-    act: gelu # choices: [full_glu, half_glu1, half_glu2, gelu]
+    ssm_post_act: gelu # choices: [full_glu, half_glu1, half_glu2, gelu]
     discretization: zoh # choices: [zoh, bilinear]
     dt_min: 0.001 # min value to sample initial timescale
     dt_max: 0.1 # max value to sample initial timescale
@@ -123,7 +123,7 @@ defaults:
     prenorm: True
     batchnorm: True
     bn_momentum: 0.95
-    s5_opt: {lr: 1e-3, bsz: 64, early_stop_patience: 1000, lr_min: 0, cosine_anneal: True, warmup_end: 1, lr_patience: 1000000, reduce_factor: 1.0, weight_decay: 0.05, opt_config: standard}
+  s5_opt: {lr: 1e-3, bsz: 64, early_stop_patience: 1000, lr_min: 0, cosine_anneal: True, warmup_end: 1, lr_patience: 1000000, reduce_factor: 1.0, weight_decay: 0.05, opt_config: standard}
 
 
 
