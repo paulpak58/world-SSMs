@@ -43,15 +43,15 @@ def apply_ssm(Lambda_bar, B_bar, C_tilde, input_sequence, conj_sym, bidirectiona
   # Discretized diagonal state matrix (P,P), input_sequence: (L, H)
   Lambda_elements = Lambda_bar * jnp.ones((input_sequence.shape[0], Lambda_bar.shape[0]))
   # B_bar: Discretized input matrix (P, H), C_tilde: Output matrix (H, P) or (2H, P)
-  print(f'b shape {B_bar.shape}')
-  raise Exception('c')
   Bu_elements = jax.vmap(lambda u: B_bar@u)(input_sequence)
   _, xs = jax.lax.associative_scan(binary_operator, (Lambda_elements, Bu_elements))
   if bidirectional:
       _, xs2 = jax.lax.associative_scan(binary_operator, (Lambda_elements, Bu_elements), reverse=True)
       xs = jnp.concatenate((xs, xs2), axis=1)
+  state = xs
   if conj_sym:
-      return jax.vmap(lambda x: 2*(C_tilde@x).real)(xs)
+      y = jax.vmap(lambda x: 2*(C_tilde@x).real)(xs)
   else:
       # SSM output y: (L, H)
-      return jax.vmap(lambda x: (C_tilde@x).real)(xs)
+      y = jax.vmap(lambda x: (C_tilde@x).real)(xs)
+  return y, state

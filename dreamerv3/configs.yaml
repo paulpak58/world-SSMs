@@ -108,7 +108,7 @@ defaults:
     ssm_size: 256  # ssm latent size (P)
     # seq_len: 64 
     blocks: 8
-    d_model: 128  # number of features
+    d_model: 512 # number of features
     n_layers: 6  # number of ssm layers
     ssm_post_act: gelu # choices: [full_glu, half_glu1, half_glu2, gelu]
     discretization: zoh # choices: [zoh, bilinear]
@@ -121,7 +121,7 @@ defaults:
 
     dropout: 0.0
     prenorm: True
-    batchnorm: True
+    batchnorm: False
     bn_momentum: 0.95
   s5_opt: {lr: 1e-3, bsz: 64, early_stop_patience: 1000, lr_min: 0, cosine_anneal: True, warmup_end: 1, lr_patience: 1000000, reduce_factor: 1.0, weight_decay: 0.05, opt_config: standard}
 

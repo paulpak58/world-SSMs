@@ -135,7 +135,7 @@ class GeneralSequenceLayer(nn.Module):
     skip = x
     if self.prenorm:
       x = self.norm(x)
-    x = self.seq(x)
+    x, state = self.seq(x)
     if self.activation in ['full_glu']:
       x = self.drop(nn.gelu(x))
       x = self.out1(x) * jax.nn.sigmoid(self.out2(x))
@@ -156,6 +156,7 @@ class GeneralSequenceLayer(nn.Module):
     x = skip + x
     if not self.prenorm:
       x = self.norm(x)
+    # return x, state
     return x
 
 
@@ -183,27 +184,24 @@ class StackedSSM(nj.Module):
       self.bn_momentum = bn_momentum
 
 
-    def __call__(self, x, deter):
-      x = jnp.concatenate([deter, x], -1)
+    def __call__(self, x, deter=None):
+      # x = jnp.concatenate([deter, x], -1)
       for l in range(self.n_layers):
-        x = nj.FlaxModule(
-          GeneralSequenceLayer, ssm=self.init_fn, dropout=self.dropout, d_model=self.d_model, activation=self.act,
-          prenorm=self.prenorm, batchnorm=self.batchnorm, bn_momentum=self.bn_momentum,
-          name=f'layer_{l}'
-        )(x)
+        # x = nj.FlaxModule(
+        #   GeneralSequenceLayer, ssm=self.init_fn, dropout=self.dropout, d_model=self.d_model, activation=self.act,
+        #   prenorm=self.prenorm, batchnorm=self.batchnorm, bn_momentum=self.bn_momentum,
+        #   name=f'layer_{l}'
+        # )(x)
         x = nj.FlaxModule(
           BatchedSequenceLayer, ssm=self.init_fn, dropout=self.dropout, d_model=self.d_model, activation=self.act,
           prenorm=self.prenorm, batchnorm=self.batchnorm, bn_momentum=self.bn_momentum,
           name=f'layer_{l}'
         )(x)
-      print(f'x shape {x.shape}')
       # for l in range(self.n_layers):
       #   x = self.get(f'layer_{l}', nj.FlaxModule(self.ssm))(x)
       #   # x = nj.FlaxModule(self.ssm, x, name=f'layer_{l}')
       #   # x = self.ssm(x)
       #   x = 
-      print(f'x shape {x.shape}')
-      raise Exception('c')
       return x
 
 
@@ -279,11 +277,19 @@ BatchedSequenceModel= nn.vmap(
   axis_name='batch'
 )
 
+# BatchedSequenceLayer = nn.vmap(
+#   GeneralSequenceLayer,
+#   in_axes=0,
+#   out_axes=0,
+#   variable_axes={'params':None, 'dropout':None, 'batch_stats':None, 'cache':0, 'prime':None},
+#   split_rngs={'params': False, 'dropout': True},
+#   axis_name='batch'
+# )
 BatchedSequenceLayer = nn.vmap(
   GeneralSequenceLayer,
-  in_axes=(0, 0),
+  in_axes=0,
   out_axes=0,
-  variable_axes={'params':None, 'dropout':None, 'batch_stats':None, 'cache':0, 'prime':None},
+  variable_axes={'params':None, 'dropout':None, 'cache':0, 'prime':None},
   split_rngs={'params': False, 'dropout': True},
   axis_name='batch'
 )
@@ -349,16 +355,15 @@ class General_RSSM(nj.Module):
     V = jax.scipy.linalg.block_diag(*[V]*self.blocks)
     Vinv = jax.scipy.linalg.block_diag(*[Vc]*self.blocks)
     # Initializes the SSM layer
-    self.init_fn = SSM_MODELS[self.ssm](
+    init_fn = SSM_MODELS[self.ssm](
       H=self.d_model, P=self.ssm_size, Lambda_re_init=Lambda.real, Lambda_im_init=Lambda.imag,
       V=V, Vinv=Vinv, C_init=self.C_init, discretization=self.discretization, dt_min=self.dt_min,
       dt_max=self.dt_max, conj_sym=self.conj_sym, clip_eigs=self.clip_eigs, bidirectional=self.bidirectional,
     )
+    return init_fn
+ 
 
   def initial(self, bs):
-    # Initialize the ssm
-    self.init_ssm(bs)
-
     # Define the initial state                
     if self._classes:
       state = dict(
@@ -381,6 +386,7 @@ class General_RSSM(nj.Module):
     else:
       raise NotImplementedError(self._initial)
 
+
   def observe(self, embed, action, is_first, state=None):
     swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
     if state is None:
@@ -388,7 +394,62 @@ class General_RSSM(nj.Module):
     step = lambda prev, inputs: self.obs_step(prev[0], *inputs)
     inputs = swap(action), swap(embed), swap(is_first)
     start = state, state
+
+    #### part of scan
+    length = len(jax.tree_util.tree_leaves(inputs)[0])
+    expand_to_seq = lambda x: jnp.repeat(x[:, None], length, 1)
+    carrydef = jax.tree_util.tree_structure(start)
+    carry = start
+    outs = []
+    print(f'length {length}')
+    print(carrydef)
+
+    # action, embed, is_first = swap(action), swap(embed), swap(is_first)
+    prev_action = action
+    prev_state = start[0]
+    is_first = cast(is_first)
+    prev_action = cast(prev_action)
+    if self._action_clip > 0.0:
+      prev_action *= sg(self._action_clip / jnp.maximum(
+          self._action_clip, jnp.abs(prev_action)))
+
+    # print(f'shapes {prev_action.shape} {is_first.shape}')
+    print(f'prev state shape {prev_state["deter"].shape}')
+    print(f'prev action shape {prev_action.shape}')
+    print(f'is first shape {is_first.shape}')
+    # expand state to length so we have (B,L,D)
+    # prev_state = jax.tree_util.tree_map(
+    #   lambda x: jnp.repeat(x[:, None], length, 1), (prev_state))
+    prev_state = jax.tree_util.tree_map(expand_to_seq, (prev_state))
+    init_seq = jax.tree_util.tree_map(expand_to_seq, (self.initial(len(is_first))))
+    prev_action, prev_state = jax.tree_util.tree_map(
+      lambda x: self._mask_sequence(x, 1.0 - is_first), (prev_action, prev_state))
+    prev_state = jax.tree_util.tree_map(
+        lambda x, y: x + self._mask_sequence(y, is_first), prev_state, init_seq) 
+    prev_stoch = prev_state['stoch']  # img step checkpoint
+    if self._classes:
+      shape = prev_stoch.shape[:-2] + (self._stoch * self._classes,)
+      prev_stoch = prev_stoch.reshape(shape)
+    if len(prev_action.shape) > len(prev_stoch.shape):  # 2D actions.
+      shape = prev_action.shape[:-2] + (np.prod(prev_action.shape[-2:]),)
+      prev_action = prev_action.reshape(shape)
+    x = jnp.concatenate([prev_stoch, prev_action], -1)
+    print(f'x shape: {x.shape}') 
+
+    # Full forward pass into S5
+    x = self.get('img_in', Linear, **self._kw)(x)
+    init_fn = self.init_ssm(x.shape[0])
+    ssm_args = {
+      'init_fn': init_fn, 'n_layers': self.n_layers, 'dropout': self.dropout, 'd_model': self.d_model,
+      'act': self.act, 'prenorm': self.prenorm, 'batchnorm': self.batchnorm, 'bn_momentum': self.bn_momentum
+    }
+    x = self.get('ssm', StackedSSM, **ssm_args)(x)
+    # x, deter = self.get('ssm', StackedSSM, **ssm_args)(x)
+    print(f'x shape: {x.shape}')
+    # print(f'deter shape: {deter.shape}')
+    raise Exception('c')
     post, prior = jaxutils.scan(step, inputs, start, self._unroll)
+
     post = {k: swap(v) for k, v in post.items()}
     prior = {k: swap(v) for k, v in prior.items()}
     # print(f'[*] OBSERVE TRAJECTORY Post keys {post.keys()}')
@@ -419,6 +480,8 @@ class General_RSSM(nj.Module):
         lambda x, y: x + self._mask(y, is_first),
         prev_state, self.initial(len(is_first)))
     prior = self.img_step(prev_state, prev_action)
+
+
     x = jnp.concatenate([prior['deter'], embed], -1)
     x = self.get('obs_out', Linear, **self._kw)(x)
     stats = self._stats('obs_stats', x)
@@ -431,6 +494,7 @@ class General_RSSM(nj.Module):
   
 
   def img_step(self, prev_state, prev_action):
+
     prev_stoch = prev_state['stoch']
     prev_action = cast(prev_action)
     if self._action_clip > 0.0:
@@ -444,11 +508,18 @@ class General_RSSM(nj.Module):
       prev_action = prev_action.reshape(shape)
     x = jnp.concatenate([prev_stoch, prev_action], -1)
     x = self.get('img_in', Linear, **self._kw)(x)
+
+    ##########################
+    # S5 Single Step
+    ##########################
+    init_fn = self.init_ssm(x.shape[0])
     ssm_args = {
-      'init_fn': self.init_fn, 'n_layers': self.n_layers, 'dropout': self.dropout, 'd_model': self.d_model,
+      'init_fn': init_fn, 'n_layers': self.n_layers, 'dropout': self.dropout, 'd_model': self.d_model,
       'act': self.act, 'prenorm': self.prenorm, 'batchnorm': self.batchnorm, 'bn_momentum': self.bn_momentum
     }
-    x = self.get('ssm', StackedSSM, **ssm_args)(x, prev_state['deter'])
+    x, deter = self.get('ssm', StackedSSM, **ssm_args)(x)
+
+
     # x, deter = self._gru(x, prev_state['deter'])
     print(f'x shape {x.shape}')
     x = self.get('img_out', Linear, **self._kw)(x)
@@ -500,6 +571,9 @@ class General_RSSM(nj.Module):
 
   def _mask(self, value, mask):
     return jnp.einsum('b...,b->b...', value, mask.astype(value.dtype))
+
+  def _mask_sequence(self, value, mask):
+    return jnp.einsum('b l ..., b l -> b l ...', value, mask.astype(value.dtype))
 
   def dyn_loss(self, post, prior, impl='kl', free=1.0):
     if impl == 'kl':

@@ -90,8 +90,6 @@ class S5Layer(nn.Module):
         self.C = self.param('C', lambda rng, shape: init_CV(C_init, rng, shape, self.V), C_shape)
         self.C_tilde = self.C[..., 0] + 1j*self.C[..., 1]
       self.D = self.param('D', jax.nn.initializers.normal(stddev=1.0), (self.H,))
-
-
       # self.log_step = self.param('log_step', init_log_steps, (self.P, self.dt_min, self.dt_max))
       self.log_step = self.param('log_step', mimo_log_step_initializer, (self.P, self.dt_min, self.dt_max))
 
@@ -105,9 +103,17 @@ class S5Layer(nn.Module):
         raise NotImplementedError(f'Discretization method {self.discretization} not implemented')
 
 
+  def step(self, prev_state, input):
+    x_k = self.Lambda_bar @ prev_state + self.B_bar @ input
+    y_k = self.C_tilde @ x_k + self.D * input
+    return x_k, y_k
+
+
   def __call__(self, input_sequence):
-    print(f'shape of input sequence: {input_sequence.shape}')
-    ys = apply_ssm(self.Lambda_bar, self.B_bar, self.C_tilde, input_sequence, self.conj_sym, self.bidirectional)
+    # print(f'shape of input sequence: {input_sequence.shape}')
+    # print(self.B_bar.shape, self.C_tilde.shape, self.D.shape, self.Lambda_bar.shape)
+    ys, state = apply_ssm(self.Lambda_bar, self.B_bar, self.C_tilde, input_sequence, self.conj_sym, self.bidirectional)
     Du = jax.vmap(lambda u: self.D*u)(input_sequence)
-    return ys + Du
+    out = ys + Du
+    return out, state
   
