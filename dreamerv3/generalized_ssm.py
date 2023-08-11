@@ -130,7 +130,7 @@ class GeneralSequenceLayer(nn.Module):
       deterministic=not self.training
     )
 
-  def __call__(self, x):
+  def __call__(self, x, state=None):
     # Takes in (L, d_model) and outputs (L, d_model)
     skip = x
     if self.prenorm:
@@ -156,8 +156,9 @@ class GeneralSequenceLayer(nn.Module):
     x = skip + x
     if not self.prenorm:
       x = self.norm(x)
-    # return x, state
-    return x
+    cache_val = self.seq.x_k_1.value
+    return x, state
+    # return x
 
 
 ##############################
@@ -184,7 +185,7 @@ class StackedSSM(nj.Module):
       self.bn_momentum = bn_momentum
 
 
-    def __call__(self, x, deter=None):
+    def __call__(self, x, state=None):
       # x = jnp.concatenate([deter, x], -1)
       for l in range(self.n_layers):
         # x = nj.FlaxModule(
@@ -192,17 +193,13 @@ class StackedSSM(nj.Module):
         #   prenorm=self.prenorm, batchnorm=self.batchnorm, bn_momentum=self.bn_momentum,
         #   name=f'layer_{l}'
         # )(x)
-        x = nj.FlaxModule(
+        x, state = nj.FlaxModule(
           BatchedSequenceLayer, ssm=self.init_fn, dropout=self.dropout, d_model=self.d_model, activation=self.act,
           prenorm=self.prenorm, batchnorm=self.batchnorm, bn_momentum=self.bn_momentum,
           name=f'layer_{l}'
-        )(x)
-      # for l in range(self.n_layers):
-      #   x = self.get(f'layer_{l}', nj.FlaxModule(self.ssm))(x)
-      #   # x = nj.FlaxModule(self.ssm, x, name=f'layer_{l}')
-      #   # x = self.ssm(x)
-      #   x = 
-      return x
+        )(x, state)
+
+      return x, state
 
 
 
@@ -433,26 +430,37 @@ class General_RSSM(nj.Module):
     if len(prev_action.shape) > len(prev_stoch.shape):  # 2D actions.
       shape = prev_action.shape[:-2] + (np.prod(prev_action.shape[-2:]),)
       prev_action = prev_action.reshape(shape)
-    x = jnp.concatenate([prev_stoch, prev_action], -1)
-    print(f'x shape: {x.shape}') 
 
-    # Full forward pass into S5
+    x = jnp.concatenate([prev_stoch, prev_action], -1)
+    # x = jnp.concatenate([prev_stoch, prev_action, embed], -1)
+
+    # Model dim encoder
     x = self.get('img_in', Linear, **self._kw)(x)
     init_fn = self.init_ssm(x.shape[0])
     ssm_args = {
       'init_fn': init_fn, 'n_layers': self.n_layers, 'dropout': self.dropout, 'd_model': self.d_model,
       'act': self.act, 'prenorm': self.prenorm, 'batchnorm': self.batchnorm, 'bn_momentum': self.bn_momentum
     }
-    x = self.get('ssm', StackedSSM, **ssm_args)(x)
-    # x, deter = self.get('ssm', StackedSSM, **ssm_args)(x)
-    print(f'x shape: {x.shape}')
-    # print(f'deter shape: {deter.shape}')
-    raise Exception('c')
-    post, prior = jaxutils.scan(step, inputs, start, self._unroll)
+    # Sequence Model forward pass
+    x, deter = self.get('ssm', StackedSSM, **ssm_args)(x, state=None)
+    # Model out decoder
+    x = self.get('img_out', Linear, **self._kw)(x)
+    stats = self._stats('img_stats', x)
+    dist = self.get_dist(stats)
+    stoch = dist.sample(seed=nj.rng())
+    prior = {'stoch': stoch, 'deter': deter, **stats}
+    print(f'prior stoch shape {prior["stoch"].shape}')
 
+    x = jnp.concatenate([prior['deter'], embed], -1)
+    x = self.get('obs_out', Linear, **self._kw)(x)
+    stats = self._stats('obs_stats', x)
+    dist = self.get_dist(stats)
+    stoch = dist.sample(seed=nj.rng())
+    post = {'stoch': stoch, 'deter': prior['deter'], **stats}
+    print(f'post stoch shape {post["stoch"].shape}')
     post = {k: swap(v) for k, v in post.items()}
     prior = {k: swap(v) for k, v in prior.items()}
-    # print(f'[*] OBSERVE TRAJECTORY Post keys {post.keys()}')
+    raise Exception('c')
     return post, prior
 
   
@@ -507,31 +515,24 @@ class General_RSSM(nj.Module):
       shape = prev_action.shape[:-2] + (np.prod(prev_action.shape[-2:]),)
       prev_action = prev_action.reshape(shape)
     x = jnp.concatenate([prev_stoch, prev_action], -1)
+    # Model dim encoder
     x = self.get('img_in', Linear, **self._kw)(x)
-
-    ##########################
-    # S5 Single Step
-    ##########################
+    # SSM initialization and single step
     init_fn = self.init_ssm(x.shape[0])
     ssm_args = {
       'init_fn': init_fn, 'n_layers': self.n_layers, 'dropout': self.dropout, 'd_model': self.d_model,
       'act': self.act, 'prenorm': self.prenorm, 'batchnorm': self.batchnorm, 'bn_momentum': self.bn_momentum
     }
+    # Model out decoder
     x, deter = self.get('ssm', StackedSSM, **ssm_args)(x)
-
-
-    # x, deter = self._gru(x, prev_state['deter'])
-    print(f'x shape {x.shape}')
     x = self.get('img_out', Linear, **self._kw)(x)
-    raise Exception('ckpt')
-  
-
     stats = self._stats('img_stats', x)
     dist = self.get_dist(stats)
     stoch = dist.sample(seed=nj.rng())
     prior = {'stoch': stoch, 'deter': deter, **stats}
-    # print(f'[*] IMAGINE STEP prior stochastic shape {prior["stoch"].shape}')
-    # print(f'[*] IMAGINE STEP prior deterministic shape {prior["deter"].shape}')
+
+    x = jnp.concatenate([prior['deter'], embed], -1)
+    raise Exception('ckpt')
     return cast(prior)
   
 

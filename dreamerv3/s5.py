@@ -102,6 +102,9 @@ class S5Layer(nn.Module):
       else:
         raise NotImplementedError(f'Discretization method {self.discretization} not implemented')
 
+    # RNN cache to store the internal states
+    self.x_k_1 = self.variable('cache', 'cache_x_k', jnp.zeros, (self.P,), jnp.complex64)
+
 
   def step(self, prev_state, input):
     x_k = self.Lambda_bar @ prev_state + self.B_bar @ input
@@ -110,9 +113,9 @@ class S5Layer(nn.Module):
 
 
   def __call__(self, input_sequence):
-    # print(f'shape of input sequence: {input_sequence.shape}')
-    # print(self.B_bar.shape, self.C_tilde.shape, self.D.shape, self.Lambda_bar.shape)
     ys, state = apply_ssm(self.Lambda_bar, self.B_bar, self.C_tilde, input_sequence, self.conj_sym, self.bidirectional)
+    if self.is_mutable_collection('cache'):
+      self.x_k_1.value = state
     Du = jax.vmap(lambda u: self.D*u)(input_sequence)
     out = ys + Du
     return out, state
