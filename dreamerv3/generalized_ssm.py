@@ -21,11 +21,13 @@ sg = lambda x: tree_map(jax.lax.stop_gradient, x)
 cast = jaxutils.cast_to_compute
 Linear = nets.Linear
 
+
 SSM_MODELS = {
   's4': S4LayerInit,
   'dss': DSSLayerInit,
   's5': S5LayerInit
 }
+
 
 
 def build_ssm(config):
@@ -130,12 +132,16 @@ class GeneralSequenceLayer(nn.Module):
       deterministic=not self.training
     )
 
-  def __call__(self, x, state=None):
+
+  def __call__(self, x, state, scan):
     # Takes in (L, d_model) and outputs (L, d_model)
     skip = x
     if self.prenorm:
       x = self.norm(x)
-    x, state = self.seq(x)
+    if scan is not None: 
+      x, state = self.seq(x)
+    else:
+      x, state = self.seq.step(x, state)
     if self.activation in ['full_glu']:
       x = self.drop(nn.gelu(x))
       x = self.out1(x) * jax.nn.sigmoid(self.out2(x))
@@ -184,21 +190,20 @@ class StackedSSM(nj.Module):
       self.batchnorm = batchnorm
       self.bn_momentum = bn_momentum
 
-
-    def __call__(self, x, state=None):
-      # x = jnp.concatenate([deter, x], -1)
+    def __call__(self, x, state=None, mode='scan'):
+      # format it as batch for vmap
+      scan = jnp.ones((x.shape[0]), dtype=jnp.int32) if mode=='scan' else None
       for l in range(self.n_layers):
-        # x = nj.FlaxModule(
+        # x, state = nj.FlaxModule(
         #   GeneralSequenceLayer, ssm=self.init_fn, dropout=self.dropout, d_model=self.d_model, activation=self.act,
         #   prenorm=self.prenorm, batchnorm=self.batchnorm, bn_momentum=self.bn_momentum,
         #   name=f'layer_{l}'
-        # )(x)
+        # )(x, state)
         x, state = nj.FlaxModule(
           BatchedSequenceLayer, ssm=self.init_fn, dropout=self.dropout, d_model=self.d_model, activation=self.act,
           prenorm=self.prenorm, batchnorm=self.batchnorm, bn_momentum=self.bn_momentum,
           name=f'layer_{l}'
-        )(x, state)
-
+        )(x, state, scan)
       return x, state
 
 
@@ -317,14 +322,23 @@ class General_RSSM(nj.Module):
     # self.ssm = nj.FlaxModule(ssm, name='ssm')
     self.ssm = 's5'
     self.n_layers = n_layers
-    self.ssm_size = ssm_size
     self.blocks = blocks
-    self.block_size = int(self.ssm_size/self.blocks)
-    self.d_model = d_model
+    self.orig_block_size = int(ssm_size/self.blocks)
+    self.conj_sym = conj_sym
+    if self.conj_sym:
+      self.block_size = self.orig_block_size//2
+      self.ssm_size = ssm_size//2
+    else:
+      self.block_size = self.orig_block_size
+      self.ssm_size = ssm_size
 
     self.dt_min = dt_min
     self.dt_max = dt_max
-    self.conj_sym = conj_sym
+    self.d_model = d_model
+    if self.ssm!='':
+      self._deter = self.ssm_size
+      assert self.d_model==self._kw['units'] # can unify these later
+
     self.clip_eigs = clip_eigs
     self.bidirectional = bidirectional
     self.C_init = C_init
@@ -339,10 +353,11 @@ class General_RSSM(nj.Module):
   def init_ssm(self, bs):
 
     # Initialize DPLR HiPPO matrix
-    Lambda, _, B, V, B_orig = make_DPLR_HiPPO(self.block_size)
-    if self.conj_sym: # conj. pairs halve the state space
-      self.block_size = self.block_size//2
-      self.ssm_size = self.ssm_size//2
+    Lambda, _, B, V, B_orig = make_DPLR_HiPPO(self.orig_block_size)
+    # if self.conj_sym: # conj. pairs halve the state space
+    #   self.block_size = self.block_size//2
+    #   self.ssm_size = self.ssm_size//2
+
     Lambda = Lambda[:self.block_size]
     V = V[:, :self.block_size]
     Vc = V.conj().T
@@ -361,24 +376,33 @@ class General_RSSM(nj.Module):
  
 
   def initial(self, bs):
-    # Define the initial state                
+    # Define the initial state
     if self._classes:
       state = dict(
-          deter=jnp.zeros([bs, self._deter], f32),
+          # deter=jnp.zeros([bs, self._deter], f32),
+          deter=jnp.zeros([bs, self._deter], jnp.complex64),
           logit=jnp.zeros([bs, self._stoch, self._classes], f32),
           stoch=jnp.zeros([bs, self._stoch, self._classes], f32))
     else:
       state = dict(
-          deter=jnp.zeros([bs, self._deter], f32),
+          # deter=jnp.zeros([bs, self._deter], f32),
+          deter=jnp.zeros([bs, self._deter], jnp.complex64),
           mean=jnp.zeros([bs, self._stoch], f32),
           std=jnp.ones([bs, self._stoch], f32),
           stoch=jnp.zeros([bs, self._stoch], f32))
     if self._initial == 'zeros':
       return cast(state)
     elif self._initial == 'learned':
-      deter = self.get('initial', jnp.zeros, state['deter'][0].shape, f32)
+      # deter = self.get('initial', jnp.zeros, state['deter'][0].shape, f32)
+      deter = self.get('initial', jnp.zeros, state['deter'][0].shape, jnp.complex64)
       state['deter'] = jnp.repeat(jnp.tanh(deter)[None], bs, 0)
-      state['stoch'] = self.get_stoch(cast(state['deter']))
+      if self.ssm=='':
+        # the stochastic component comes from the hidden state
+        state['stoch'] = self.get_stoch(cast(state['deter']))
+      else:
+        # the stochatic component comes from our output
+        dummy_out = jnp.zeros([bs, self.d_model], f32)
+        state['stoch'] = self.get_stoch(cast(dummy_out))
       return cast(state)
     else:
       raise NotImplementedError(self._initial)
@@ -388,41 +412,29 @@ class General_RSSM(nj.Module):
     swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
     if state is None:
       state = self.initial(action.shape[0])
-    step = lambda prev, inputs: self.obs_step(prev[0], *inputs)
     inputs = swap(action), swap(embed), swap(is_first)
-    start = state, state
 
-    #### part of scan
-    length = len(jax.tree_util.tree_leaves(inputs)[0])
-    expand_to_seq = lambda x: jnp.repeat(x[:, None], length, 1)
-    carrydef = jax.tree_util.tree_structure(start)
-    carry = start
-    outs = []
-    print(f'length {length}')
-    print(carrydef)
+    # Make sure that everything is right format and within bounds
+    seq_len = len(jax.tree_util.tree_leaves(inputs)[0])
+    expand_to_seq = lambda x: jnp.repeat(x[:, None], seq_len, 1)
+    prev_state = state
 
-    # action, embed, is_first = swap(action), swap(embed), swap(is_first)
-    prev_action = action
-    prev_state = start[0]
     is_first = cast(is_first)
-    prev_action = cast(prev_action)
+    prev_action = cast(action)
     if self._action_clip > 0.0:
       prev_action *= sg(self._action_clip / jnp.maximum(
           self._action_clip, jnp.abs(prev_action)))
 
-    # print(f'shapes {prev_action.shape} {is_first.shape}')
-    print(f'prev state shape {prev_state["deter"].shape}')
-    print(f'prev action shape {prev_action.shape}')
-    print(f'is first shape {is_first.shape}')
-    # expand state to length so we have (B,L,D)
-    # prev_state = jax.tree_util.tree_map(
-    #   lambda x: jnp.repeat(x[:, None], length, 1), (prev_state))
+    # Expand our init variables to match  sequence length
     prev_state = jax.tree_util.tree_map(expand_to_seq, (prev_state))
     init_seq = jax.tree_util.tree_map(expand_to_seq, (self.initial(len(is_first))))
+    # Make given (L, B) sequence
     prev_action, prev_state = jax.tree_util.tree_map(
       lambda x: self._mask_sequence(x, 1.0 - is_first), (prev_action, prev_state))
     prev_state = jax.tree_util.tree_map(
         lambda x, y: x + self._mask_sequence(y, is_first), prev_state, init_seq) 
+
+
     prev_stoch = prev_state['stoch']  # img step checkpoint
     if self._classes:
       shape = prev_stoch.shape[:-2] + (self._stoch * self._classes,)
@@ -430,37 +442,57 @@ class General_RSSM(nj.Module):
     if len(prev_action.shape) > len(prev_stoch.shape):  # 2D actions.
       shape = prev_action.shape[:-2] + (np.prod(prev_action.shape[-2:]),)
       prev_action = prev_action.reshape(shape)
-
+    # Prior takes in previous output and input action
     x = jnp.concatenate([prev_stoch, prev_action], -1)
-    # x = jnp.concatenate([prev_stoch, prev_action, embed], -1)
 
     # Model dim encoder
     x = self.get('img_in', Linear, **self._kw)(x)
     init_fn = self.init_ssm(x.shape[0])
-    ssm_args = {
-      'init_fn': init_fn, 'n_layers': self.n_layers, 'dropout': self.dropout, 'd_model': self.d_model,
-      'act': self.act, 'prenorm': self.prenorm, 'batchnorm': self.batchnorm, 'bn_momentum': self.bn_momentum
-    }
-    # Sequence Model forward pass
-    x, deter = self.get('ssm', StackedSSM, **ssm_args)(x, state=None)
-    # Model out decoder
-    x = self.get('img_out', Linear, **self._kw)(x)
+    ssm_args = {'init_fn': init_fn, 'n_layers': self.n_layers, 'dropout': self.dropout, 'd_model': self.d_model,
+      'act': self.act, 'prenorm': self.prenorm, 'batchnorm': self.batchnorm, 'bn_momentum': self.bn_momentum}
+    # Sequence Model batched scan
+
+    # out, deter = [], []
+    # import time
+    # start = time.time()
+    # for idx in range(x.shape[0]):
+    #   b_x = x[idx]
+    #   b_out, b_deter = self.get('ssm', StackedSSM, **ssm_args)(b_x, state=None)
+    #   out.append(b_out)
+    #   deter.append(b_deter)
+    # out = jnp.stack(out, 0)
+    # deter = jnp.stack(deter, 0)
+    # end = time.time()
+    # print(f'time in ms {(end - start)}')
+    # print(f'out shape {out.shape} deter shape {deter.shape}')
+    # raise Exception('c')
+
+    full_bz = x.shape[0]*x.shape[1]
+    dummy_in = jnp.zeros((full_bz, x.shape[-2], x.shape[-1]), f32)
+    expanded_x = dummy_in.at[:x.shape[0]].set(x)
+    expanded_out, expanded_deter = self.get('ssm', StackedSSM, **ssm_args)(expanded_x, state=None)
+    out = expanded_out[:x.shape[0]]
+    deter = expanded_deter[:x.shape[0]]
+    # out, deter = self.get('ssm', StackedSSM, **ssm_args)(x, state=None)
+
+    # 1. Calculate the prior
+    x = self.get('img_out', Linear, **self._kw)(out)
     stats = self._stats('img_stats', x)
     dist = self.get_dist(stats)
     stoch = dist.sample(seed=nj.rng())
     prior = {'stoch': stoch, 'deter': deter, **stats}
-    print(f'prior stoch shape {prior["stoch"].shape}')
+    # prior = {'stoch': stoch, 'deter': out, **stats}
+    # prior = cast(prior)
 
-    x = jnp.concatenate([prior['deter'], embed], -1)
+    # 2. Calculate the posterior
+    x = jnp.concatenate([out, embed], -1)
     x = self.get('obs_out', Linear, **self._kw)(x)
     stats = self._stats('obs_stats', x)
     dist = self.get_dist(stats)
     stoch = dist.sample(seed=nj.rng())
     post = {'stoch': stoch, 'deter': prior['deter'], **stats}
-    print(f'post stoch shape {post["stoch"].shape}')
-    post = {k: swap(v) for k, v in post.items()}
-    prior = {k: swap(v) for k, v in prior.items()}
-    raise Exception('c')
+    # post = {k: swap(v) for k, v in post.items()}
+    # prior = {k: swap(v) for k, v in prior.items()}
     return post, prior
 
   
@@ -469,71 +501,107 @@ class General_RSSM(nj.Module):
     swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
     state = self.initial(action.shape[0]) if state is None else state
     assert isinstance(state, dict), state
-    action = swap(action)
-    prior = jaxutils.scan(self.img_step, action, state, self._unroll)
-    prior = {k: swap(v) for k, v in prior.items()}
-    # print(f'[*] IMAGINE TRAJECTORY Prior keys {prior.keys()}')
-    return prior
-  
+    # action = swap(action)
+    # prior = jaxutils.scan(self.img_step, action, state, self._unroll)
+    # prior = {k: swap(v) for k, v in prior.items()}
 
-  def obs_step(self, prev_state, prev_action, embed, is_first):
-    is_first = cast(is_first)
-    prev_action = cast(prev_action)
-    if self._action_clip > 0.0:
-      prev_action *= sg(self._action_clip / jnp.maximum(
-          self._action_clip, jnp.abs(prev_action)))
-    prev_state, prev_action = jax.tree_util.tree_map(
-        lambda x: self._mask(x, 1.0 - is_first), (prev_state, prev_action))
-    prev_state = jax.tree_util.tree_map(
-        lambda x, y: x + self._mask(y, is_first),
-        prev_state, self.initial(len(is_first)))
-    prior = self.img_step(prev_state, prev_action)
-
-
-    x = jnp.concatenate([prior['deter'], embed], -1)
-    x = self.get('obs_out', Linear, **self._kw)(x)
-    stats = self._stats('obs_stats', x)
-    dist = self.get_dist(stats)
-    stoch = dist.sample(seed=nj.rng())
-    post = {'stoch': stoch, 'deter': prior['deter'], **stats}
-    # print(f'[*] OBSERVE STEP posterior stochastic shape {post["stoch"].shape}')
-    # print(f'[*] OBSERVE STEP posterior deterministic shape {post["deter"].shape}')
-    return cast(post), cast(prior)
-  
-
-  def img_step(self, prev_state, prev_action):
-
-    prev_stoch = prev_state['stoch']
-    prev_action = cast(prev_action)
-    if self._action_clip > 0.0:
-      prev_action *= sg(self._action_clip / jnp.maximum(
-          self._action_clip, jnp.abs(prev_action)))
+    prev_stoch = state['stoch']  # img step checkpoint
+    prev_action = action
     if self._classes:
       shape = prev_stoch.shape[:-2] + (self._stoch * self._classes,)
       prev_stoch = prev_stoch.reshape(shape)
     if len(prev_action.shape) > len(prev_stoch.shape):  # 2D actions.
       shape = prev_action.shape[:-2] + (np.prod(prev_action.shape[-2:]),)
       prev_action = prev_action.reshape(shape)
+    # Prior takes in previous output and input action
     x = jnp.concatenate([prev_stoch, prev_action], -1)
+
     # Model dim encoder
     x = self.get('img_in', Linear, **self._kw)(x)
-    # SSM initialization and single step
     init_fn = self.init_ssm(x.shape[0])
-    ssm_args = {
-      'init_fn': init_fn, 'n_layers': self.n_layers, 'dropout': self.dropout, 'd_model': self.d_model,
-      'act': self.act, 'prenorm': self.prenorm, 'batchnorm': self.batchnorm, 'bn_momentum': self.bn_momentum
-    }
-    # Model out decoder
-    x, deter = self.get('ssm', StackedSSM, **ssm_args)(x)
-    x = self.get('img_out', Linear, **self._kw)(x)
+    ssm_args = {'init_fn': init_fn, 'n_layers': self.n_layers, 'dropout': self.dropout, 'd_model': self.d_model,
+      'act': self.act, 'prenorm': self.prenorm, 'batchnorm': self.batchnorm, 'bn_momentum': self.bn_momentum}
+    
+
+    # Sequence Model batched scan
+    full_bz = x.shape[0]*x.shape[1]
+    dummy_in = jnp.zeros((full_bz, x.shape[-2], x.shape[-1]), f32)
+    expanded_x = dummy_in.at[:x.shape[0]].set(x)
+    expanded_out, expanded_deter = self.get('ssm', StackedSSM, **ssm_args)(expanded_x, state=None)
+    out = expanded_out[:x.shape[0]]
+    deter = expanded_deter[:x.shape[0]]
+
+    # 1. Calculate the prior
+    x = self.get('img_out', Linear, **self._kw)(out)
     stats = self._stats('img_stats', x)
     dist = self.get_dist(stats)
     stoch = dist.sample(seed=nj.rng())
     prior = {'stoch': stoch, 'deter': deter, **stats}
+    # prior = {'stoch': stoch, 'deter': out, **stats}
+    # prior = cast(prior)
+    return prior
+  
 
-    x = jnp.concatenate([prior['deter'], embed], -1)
-    raise Exception('ckpt')
-    return cast(prior)
+  def obs_step(self, prev_state, prev_action, embed, is_first):
+    print(f'prev state shape {prev_state["stoch"].shape} prev action shape {prev_action.shape} embed shape {embed.shape} is first shape {is_first.shape}')
+    raise Exception('obs')
+    is_first = cast(is_first)
+    prev_action = cast(prev_action)
+    if self._action_clip > 0.0:
+      prev_action *= sg(self._action_clip / jnp.maximum(
+          self._action_clip, jnp.abs(prev_action)))
+
+    # Expand our init variables to match  sequence length
+    prev_state = jax.tree_util.tree_map(expand_to_seq, (prev_state))
+    init_seq = jax.tree_util.tree_map(expand_to_seq, (self.initial(len(is_first))))
+    # Make given (L, B) sequence
+    prev_action, prev_state = jax.tree_util.tree_map(
+      lambda x: self._mask_sequence(x, 1.0 - is_first), (prev_action, prev_state))
+    prev_state = jax.tree_util.tree_map(
+        lambda x, y: x + self._mask_sequence(y, is_first), prev_state, init_seq) 
+
+    return cast(post), cast(prior)
+  
+
+  def img_step(self, prev_state, prev_action):
+    prev_stoch = prev_state['stoch']
+    prev_action = cast(prev_action)
+    if self._classes:
+      shape = prev_stoch.shape[:-2] + (self._stoch * self._classes,)
+      prev_stoch = prev_stoch.reshape(shape)
+    if len(prev_action.shape) > len(prev_stoch.shape):  # 2D actions.
+      shape = prev_action.shape[:-2] + (np.prod(prev_action.shape[-2:]),)
+      prev_action = prev_action.reshape(shape)
+    # Prior takes in previous output and input action
+    x = jnp.concatenate([prev_stoch, prev_action], -1)
+
+    # Model dim encoder
+    x = self.get('img_in', Linear, **self._kw)(x)
+    init_fn = self.init_ssm(x.shape[0])
+    ssm_args = {'init_fn': init_fn, 'n_layers': self.n_layers, 'dropout': self.dropout, 'd_model': self.d_model,
+      'act': self.act, 'prenorm': self.prenorm, 'batchnorm': self.batchnorm, 'bn_momentum': self.bn_momentum}
+
+    # Inputs come in as different batch size, so we reshape to still use vmap() instead of looping
+    # prep_seq = lambda x: x[:, None, :]
+    # x = prep_seq(x)
+    # deter = prep_seq(prev_state['deter'])
+    # repeat_batch = lambda x: jnp.repeat(x[None, :], bz, 0)
+    # x = repeat_batch(x)
+    # deter = repeat_batch(prev_state['deter'])
+
+    # Inference step with SSM
+    deter = prev_state['deter']
+    out, deter = self.get('ssm', StackedSSM, **ssm_args)(x=x, state=deter, mode='step')
+
+    # 1. Calculate the prior
+    x = self.get('img_out', Linear, **self._kw)(out)
+    stats = self._stats('img_stats', x)
+    dist = self.get_dist(stats)
+    stoch = dist.sample(seed=nj.rng())
+    prior = {'stoch': stoch, 'deter': deter, **stats}
+    # prior = {'stoch': stoch, 'deter': out, **stats}
+    # return cast(prior)
+    return prior
   
 
   def get_dist(self, state, argmax=False):

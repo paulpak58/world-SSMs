@@ -106,10 +106,10 @@ class S5Layer(nn.Module):
     self.x_k_1 = self.variable('cache', 'cache_x_k', jnp.zeros, (self.P,), jnp.complex64)
 
 
-  def step(self, prev_state, input):
+  def step(self, input, prev_state):
     x_k = self.Lambda_bar @ prev_state + self.B_bar @ input
     y_k = self.C_tilde @ x_k + self.D * input
-    return x_k, y_k
+    return y_k, x_k
 
 
   def __call__(self, input_sequence):
