@@ -10,30 +10,32 @@ import ninjax as nj
 from discretization import discretize_zoh, discretize_bilinear
 from scan import apply_ssm
 from initializers import init_VinvB, init_CV, mimo_log_step_initializer, trunc_standard_normal
+from initializers import make_DPLR_HiPPO
+
 
 
 ###############################
 # Instantiates a single S5 layer
 ###############################
 def S5LayerInit(
-  H, P, Lambda_re_init, Lambda_im_init, V, Vinv, C_init, discretization, dt_min, dt_max, conj_sym, clip_eigs, bidirectional
+  blocks, init_block_size, H, P, C_init, discretization, dt_min, dt_max, conj_sym, clip_eigs, bidirectional
 ):
   # H=d_model, P=ssm_size
   return partial(
-    S5Layer, H=H, P=P, Lambda_re_init=Lambda_re_init, Lambda_im_init=Lambda_im_init,
-    V=V, Vinv=Vinv, C_init=C_init, discretization=discretization, dt_min=dt_min, dt_max=dt_max,\
-    conj_sym=conj_sym, clip_eigs=clip_eigs, bidirectional=bidirectional
+    S5Layer, blocks=blocks, init_block_size=init_block_size, H=H, P=P, C_init=C_init, discretization=discretization,
+    dt_min=dt_min, dt_max=dt_max, conj_sym=conj_sym, clip_eigs=clip_eigs, bidirectional=bidirectional, 
   )
-
 
 ###############################
 # Flax implementation of S5 Layer
 ###############################
 class S5Layer(nn.Module):
-  Lambda_re_init: jnp.DeviceArray # (P, )
-  Lambda_im_init: jnp.DeviceArray # (P, )
-  V: jnp.DeviceArray  # (P, P)
-  Vinv: jnp.DeviceArray # (P, P)
+  # Lambda_re_init: jnp.DeviceArray # (P, )
+  # Lambda_im_init: jnp.DeviceArray # (P, )
+  # V: jnp.DeviceArray  # (P, P)
+  # Vinv: jnp.DeviceArray # (P, P)
+  blocks: int
+  init_block_size: int
 
   H: int  # input features
   P: int  # state dim
@@ -46,13 +48,32 @@ class S5Layer(nn.Module):
   bidirectional: bool=False
   step_rescale: float=1.0
 
+
+
   #########################################################
   # Initialize params once, Perform discretization each step
   #########################################################
   def setup(self):
+    # Initialize DPLR HiPPO matrix
+    Lambda, _, B, V, B_orig = make_DPLR_HiPPO(self.init_block_size)
+    block_size = self.init_block_size//2 if self.conj_sym else self.init_block_size # conj. pairs halve the state space
+    Lambda = Lambda[:block_size]
+    V = V[:, :block_size]
+    Vc = V.conj().T
+
+    # Put each HiPPO on each block diagonal
+    Lambda = (Lambda * jnp.ones((self.blocks, block_size))).ravel()
+    V = jax.scipy.linalg.block_diag(*[V]*self.blocks)
+    Vinv = jax.scipy.linalg.block_diag(*[Vc]*self.blocks)
+    self.Lambda_re_init, self.Lambda_im_init = Lambda.real, Lambda.imag
+    self.V, self.Vinv = V, Vinv
+
+
     local_P = 2*self.P if self.conj_sym else self.P
     self.Lambda_re = self.param('Lambda_re', lambda rng, shape: self.Lambda_re_init, (None,))
     self.Lambda_im = self.param('Lambda_im', lambda rng, shape: self.Lambda_im_init, (None,))
+    # self.Lambda_re = self.param('Lambda_re', lambda rng, shape: self.Lambda_re_init, (None,))
+    # self.Lambda_im = self.param('Lambda_im', lambda rng, shape: self.Lambda_im_init, (None,))
     if self.clip_eigs:
       self.Lambda = jnp.clip(self.Lambda_re, None, -1e-4) + 1j*self.Lambda_im
     else:
@@ -103,19 +124,19 @@ class S5Layer(nn.Module):
         raise NotImplementedError(f'Discretization method {self.discretization} not implemented')
 
     # RNN cache to store the internal states
-    self.x_k_1 = self.variable('cache', 'cache_x_k', jnp.zeros, (self.P,), jnp.complex64)
+    # self.x_k_1 = self.variable('cache', 'cache_x_k', jnp.zeros, (self.P,), jnp.complex64)
 
 
   def step(self, input, prev_state):
     x_k = self.Lambda_bar @ prev_state + self.B_bar @ input
-    y_k = self.C_tilde @ x_k + self.D * input
+    y_k = (self.C_tilde @ x_k).real + self.D * input
     return y_k, x_k
 
 
   def __call__(self, input_sequence):
     ys, state = apply_ssm(self.Lambda_bar, self.B_bar, self.C_tilde, input_sequence, self.conj_sym, self.bidirectional)
-    if self.is_mutable_collection('cache'):
-      self.x_k_1.value = state
+    # if self.is_mutable_collection('cache'):
+    #   self.x_k_1.value = state
     Du = jax.vmap(lambda u: self.D*u)(input_sequence)
     out = ys + Du
     return out, state

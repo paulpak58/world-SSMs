@@ -29,51 +29,9 @@ SSM_MODELS = {
 }
 
 
-
 def build_ssm(config):
-
   if config.ssm =='s5':
-
-    ssm_size = config.s5.ssm_size
-    block_size = int(ssm_size/config.s5.blocks)  # size of initial blocks
-    # padded = False
-    # in_dim = config.embed_dim
-    # train_size = config.train_size
-
-    # Initialize DPLR HiPPO matrix
-    Lambda, _, B, V, B_orig = make_DPLR_HiPPO(block_size)
-    if config.s5.conj_sym: # conj. pairs halve the state space
-      block_size = block_size//2
-      ssm_size = ssm_size//2
-    Lambda = Lambda[:block_size]
-    V = V[:, :block_size]
-    Vc = V.conj().T
-
-    # Put each HiPPO on each block diagonal
-    Lambda = (Lambda * jnp.ones((config.s5.blocks, block_size))).ravel()
-    V = jax.scipy.linalg.block_diag(*[V]*config.s5.blocks)
-    Vinv = jax.scipy.linalg.block_diag(*[Vc]*config.s5.blocks)
-    # Initializes the SSM layer
-    init_fn = SSM_MODELS[config.ssm](
-      H=config.s5.d_model, P=config.s5.ssm_size, Lambda_re_init=Lambda.real, Lambda_im_init=Lambda.imag,
-      V=V, Vinv=Vinv, C_init=config.s5.C_init, discretization=config.s5.discretization, dt_min=config.s5.dt_min,
-      dt_max=config.s5.dt_max, conj_sym=config.s5.conj_sym, clip_eigs=config.s5.clip_eigs, bidirectional=config.s5.bidirectional,
-    )
-    # Creates full batched model based on the SSM layer
-    model = partial(
-      BatchedSequenceModel,
-      ssm=init_fn,
-      d_output=config.s5.seq_len, #TODO
-      d_model=config.s5.d_model,
-      n_layers=config.s5.n_layers,
-      activation=config.s5.act,
-      dropout=config.s5.dropout,
-      prenorm=config.s5.prenorm,
-      batchnorm=config.s5.batchnorm,
-      bn_momentum=config.s5.bn_momentum
-    )
-    ssm = General_RSSM(model, name='s5')
-
+    raise NotImplementedError
   elif config.ssm=='s4':
     raise NotImplementedError
   elif config.ssm=='s4d':
@@ -88,7 +46,6 @@ def build_ssm(config):
     raise NotImplementedError
   else:
     raise NotImplementedError
-
   return ssm  
 
 ########################################
@@ -98,6 +55,54 @@ def masked_meanpool(x, lengths):
   L = x.shape[0]
   mask = jnp.arange(L)<lengths
   return jnp.sum(mask[...,None]*x, axis=0)/lengths
+
+
+class NJGeneralSequenceLayer(nj.Module):
+  ssm: nn.Module
+  dropout: float
+  d_model: int
+  activation: str='gelu'
+  training: bool=True
+  prenorm: bool=False
+  batchnorm: bool=False
+  bn_momentum: float=0.9
+  step_rescale: float=1.0
+
+  def __init__(self, ssm):
+    raise NotImplementedError
+
+  def __call__(self, x, state, scan):
+    # Takes in (L, d_model) and outputs (L, d_model)
+    skip = x
+    if self.prenorm:
+      x = self.norm(x)
+    if scan is not None: 
+      x, state = self.seq(x)
+    else:
+      x, state = self.seq.step(x, state)
+    if self.activation in ['full_glu']:
+      x = self.drop(nn.gelu(x))
+      x = self.out1(x) * jax.nn.sigmoid(self.out2(x))
+      x = self.drop(x)
+    elif self.activation in ['half_glu1']:
+      x = self.drop(nn.gelu(x))
+      x = x * jax.nn.sigmoid(self.out2(x))
+      x = self.drop(x)
+    elif self.activation in ['half_glu2']:
+      # only apply GELU to the gate input
+      x1 = self.drop(nn.gelu(x))
+      x = x * jax.nn.sigmoid(self.out2(x1))
+      x = self.drop(x)
+    elif self.activation in ['gelu']:
+      x = self.drop(nn.gelu(x))
+    else:
+      raise NotImplementedError(f'Activation {self.activation} not implemented')
+    x = skip + x
+    if not self.prenorm:
+      x = self.norm(x)
+    # cache_val = self.seq.x_k_1.value
+    return x, state
+
 
 
 ###############################################
@@ -162,7 +167,7 @@ class GeneralSequenceLayer(nn.Module):
     x = skip + x
     if not self.prenorm:
       x = self.norm(x)
-    cache_val = self.seq.x_k_1.value
+    # cache_val = self.seq.x_k_1.value
     return x, state
     # return x
 
@@ -319,74 +324,58 @@ class General_RSSM(nj.Module):
     self._action_clip = action_clip
     self._kw = kw
 
-    # self.ssm = nj.FlaxModule(ssm, name='ssm')
+    # HiPPO Matrix set-up args
     self.ssm = 's5'
-    self.n_layers = n_layers
     self.blocks = blocks
-    self.orig_block_size = int(ssm_size/self.blocks)
+    self.ssm_size = ssm_size
+    self.init_block_size = int(self.ssm_size/self.blocks)
     self.conj_sym = conj_sym
-    if self.conj_sym:
-      self.block_size = self.orig_block_size//2
-      self.ssm_size = ssm_size//2
-    else:
-      self.block_size = self.orig_block_size
-      self.ssm_size = ssm_size
+    self.ssm_size = self.ssm_size//2 if self.conj_sym else self.ssm_size
 
-    self.dt_min = dt_min
-    self.dt_max = dt_max
-    self.d_model = d_model
-    if self.ssm!='':
-      self._deter = self.ssm_size
-      assert self.d_model==self._kw['units'] # can unify these later
-
-    self.clip_eigs = clip_eigs
-    self.bidirectional = bidirectional
+    # Discretization and initialization args
     self.C_init = C_init
     self.discretization = discretization
+    self.dt_min = dt_min
+    self.dt_max = dt_max
+    self.clip_eigs = clip_eigs
+    self.bidirectional = bidirectional
 
-    self.act = ssm_post_act
+    # General Sequence Layer args
+    self.n_layers = n_layers
     self.dropout = dropout
+    self.d_model = d_model
+    self.act = ssm_post_act
     self.prenorm = prenorm
     self.batchnorm = batchnorm
     self.bn_momentum = bn_momentum
 
-  def init_ssm(self, bs):
-
-    # Initialize DPLR HiPPO matrix
-    Lambda, _, B, V, B_orig = make_DPLR_HiPPO(self.orig_block_size)
-    # if self.conj_sym: # conj. pairs halve the state space
-    #   self.block_size = self.block_size//2
-    #   self.ssm_size = self.ssm_size//2
-
-    Lambda = Lambda[:self.block_size]
-    V = V[:, :self.block_size]
-    Vc = V.conj().T
-
-    # Put each HiPPO on each block diagonal
-    Lambda = (Lambda * jnp.ones((self.blocks, self.block_size))).ravel()
-    V = jax.scipy.linalg.block_diag(*[V]*self.blocks)
-    Vinv = jax.scipy.linalg.block_diag(*[Vc]*self.blocks)
-    # Initializes the SSM layer
+    # Calling this function instantiates a single layer
     init_fn = SSM_MODELS[self.ssm](
-      H=self.d_model, P=self.ssm_size, Lambda_re_init=Lambda.real, Lambda_im_init=Lambda.imag,
-      V=V, Vinv=Vinv, C_init=self.C_init, discretization=self.discretization, dt_min=self.dt_min,
-      dt_max=self.dt_max, conj_sym=self.conj_sym, clip_eigs=self.clip_eigs, bidirectional=self.bidirectional,
+      blocks=self.blocks, init_block_size=self.init_block_size, H=self.d_model, P=self.ssm_size, C_init=self.C_init, discretization=self.discretization,
+      dt_min=self.dt_min, dt_max=self.dt_max, conj_sym=self.conj_sym, clip_eigs=self.clip_eigs, bidirectional=self.bidirectional, 
     )
-    return init_fn
- 
+    self.ssm_args = {'init_fn': init_fn, 'n_layers': self.n_layers, 'dropout': self.dropout, 'd_model': self.d_model,
+      'act': self.act, 'prenorm': self.prenorm, 'batchnorm': self.batchnorm, 'bn_momentum': self.bn_momentum}
+
+
 
   def initial(self, bs):
+
     # Define the initial state
     if self._classes:
       state = dict(
-          # deter=jnp.zeros([bs, self._deter], f32),
-          deter=jnp.zeros([bs, self._deter], jnp.complex64),
-          logit=jnp.zeros([bs, self._stoch, self._classes], f32),
-          stoch=jnp.zeros([bs, self._stoch, self._classes], f32))
+          deter=jnp.zeros([bs, self._deter], f32),  # deterministic output
+          # hidden=jnp.zeros([bs, self.ssm_size], jnp.complex64), # hidden state
+          hidden_re=jnp.zeros([bs, self.ssm_size], f32), # hidden state
+          hidden_im=jnp.zeros([bs, self.ssm_size], f32), # hidden state
+          logit=jnp.zeros([bs, self._stoch, self._classes], f32), # predictions
+          stoch=jnp.zeros([bs, self._stoch, self._classes], f32)) # stochastic output
     else:
       state = dict(
-          # deter=jnp.zeros([bs, self._deter], f32),
-          deter=jnp.zeros([bs, self._deter], jnp.complex64),
+          deter=jnp.zeros([bs, self._deter], f32),
+          # hidden=jnp.zeros([bs, self.ssm_size], jnp.complex64),
+          hidden_re=jnp.zeros([bs, self.ssm_size], f32),
+          hidden_im=jnp.zeros([bs, self.ssm_size], f32),
           mean=jnp.zeros([bs, self._stoch], f32),
           std=jnp.ones([bs, self._stoch], f32),
           stoch=jnp.zeros([bs, self._stoch], f32))
@@ -431,9 +420,9 @@ class General_RSSM(nj.Module):
     # Make given (L, B) sequence
     prev_action, prev_state = jax.tree_util.tree_map(
       lambda x: self._mask_sequence(x, 1.0 - is_first), (prev_action, prev_state))
+    # match type of prev state components
     prev_state = jax.tree_util.tree_map(
         lambda x, y: x + self._mask_sequence(y, is_first), prev_state, init_seq) 
-
 
     prev_stoch = prev_state['stoch']  # img step checkpoint
     if self._classes:
@@ -447,42 +436,20 @@ class General_RSSM(nj.Module):
 
     # Model dim encoder
     x = self.get('img_in', Linear, **self._kw)(x)
-    init_fn = self.init_ssm(x.shape[0])
-    ssm_args = {'init_fn': init_fn, 'n_layers': self.n_layers, 'dropout': self.dropout, 'd_model': self.d_model,
-      'act': self.act, 'prenorm': self.prenorm, 'batchnorm': self.batchnorm, 'bn_momentum': self.bn_momentum}
     # Sequence Model batched scan
-
-    # out, deter = [], []
-    # import time
-    # start = time.time()
-    # for idx in range(x.shape[0]):
-    #   b_x = x[idx]
-    #   b_out, b_deter = self.get('ssm', StackedSSM, **ssm_args)(b_x, state=None)
-    #   out.append(b_out)
-    #   deter.append(b_deter)
-    # out = jnp.stack(out, 0)
-    # deter = jnp.stack(deter, 0)
-    # end = time.time()
-    # print(f'time in ms {(end - start)}')
-    # print(f'out shape {out.shape} deter shape {deter.shape}')
-    # raise Exception('c')
-
     full_bz = x.shape[0]*x.shape[1]
     dummy_in = jnp.zeros((full_bz, x.shape[-2], x.shape[-1]), f32)
     expanded_x = dummy_in.at[:x.shape[0]].set(x)
-    expanded_out, expanded_deter = self.get('ssm', StackedSSM, **ssm_args)(expanded_x, state=None)
+    expanded_out, expanded_deter = self.get('ssm', StackedSSM, **self.ssm_args)(expanded_x, state=None)
     out = expanded_out[:x.shape[0]]
     deter = expanded_deter[:x.shape[0]]
-    # out, deter = self.get('ssm', StackedSSM, **ssm_args)(x, state=None)
 
     # 1. Calculate the prior
     x = self.get('img_out', Linear, **self._kw)(out)
     stats = self._stats('img_stats', x)
     dist = self.get_dist(stats)
     stoch = dist.sample(seed=nj.rng())
-    prior = {'stoch': stoch, 'deter': deter, **stats}
-    # prior = {'stoch': stoch, 'deter': out, **stats}
-    # prior = cast(prior)
+    prior = cast({'stoch': stoch, 'deter': out, 'hidden_re': deter.real, 'hidden_im': deter.imag, **stats})
 
     # 2. Calculate the posterior
     x = jnp.concatenate([out, embed], -1)
@@ -490,20 +457,16 @@ class General_RSSM(nj.Module):
     stats = self._stats('obs_stats', x)
     dist = self.get_dist(stats)
     stoch = dist.sample(seed=nj.rng())
-    post = {'stoch': stoch, 'deter': prior['deter'], **stats}
-    # post = {k: swap(v) for k, v in post.items()}
-    # prior = {k: swap(v) for k, v in prior.items()}
-    return post, prior
+    # post = {'stoch': stoch, 'deter': prior['deter'], 'hidden': prior['hidden'], **stats}
+    post = cast({'stoch': stoch, 'deter': prior['deter'], 'hidden_re': prior['hidden_re'], 'hidden_im': prior['hidden_im'], **stats})
 
+    return post, prior
   
 
   def imagine(self, action, state=None):
     swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
     state = self.initial(action.shape[0]) if state is None else state
     assert isinstance(state, dict), state
-    # action = swap(action)
-    # prior = jaxutils.scan(self.img_step, action, state, self._unroll)
-    # prior = {k: swap(v) for k, v in prior.items()}
 
     prev_stoch = state['stoch']  # img step checkpoint
     prev_action = action
@@ -518,16 +481,12 @@ class General_RSSM(nj.Module):
 
     # Model dim encoder
     x = self.get('img_in', Linear, **self._kw)(x)
-    init_fn = self.init_ssm(x.shape[0])
-    ssm_args = {'init_fn': init_fn, 'n_layers': self.n_layers, 'dropout': self.dropout, 'd_model': self.d_model,
-      'act': self.act, 'prenorm': self.prenorm, 'batchnorm': self.batchnorm, 'bn_momentum': self.bn_momentum}
-    
 
     # Sequence Model batched scan
     full_bz = x.shape[0]*x.shape[1]
     dummy_in = jnp.zeros((full_bz, x.shape[-2], x.shape[-1]), f32)
     expanded_x = dummy_in.at[:x.shape[0]].set(x)
-    expanded_out, expanded_deter = self.get('ssm', StackedSSM, **ssm_args)(expanded_x, state=None)
+    expanded_out, expanded_deter = self.get('ssm', StackedSSM, **self.ssm_args)(expanded_x, state=None)
     out = expanded_out[:x.shape[0]]
     deter = expanded_deter[:x.shape[0]]
 
@@ -536,10 +495,8 @@ class General_RSSM(nj.Module):
     stats = self._stats('img_stats', x)
     dist = self.get_dist(stats)
     stoch = dist.sample(seed=nj.rng())
-    prior = {'stoch': stoch, 'deter': deter, **stats}
-    # prior = {'stoch': stoch, 'deter': out, **stats}
-    # prior = cast(prior)
-    return prior
+    prior = {'stoch': stoch, 'deter': out, 'hidden_re': deter.real, 'hidden_im': deter.imag, **stats}
+    return cast(prior)
   
 
   def obs_step(self, prev_state, prev_action, embed, is_first):
@@ -566,6 +523,9 @@ class General_RSSM(nj.Module):
   def img_step(self, prev_state, prev_action):
     prev_stoch = prev_state['stoch']
     prev_action = cast(prev_action)
+    if self._action_clip > 0.0:
+      prev_action *= sg(self._action_clip / jnp.maximum(
+          self._action_clip, jnp.abs(prev_action)))
     if self._classes:
       shape = prev_stoch.shape[:-2] + (self._stoch * self._classes,)
       prev_stoch = prev_stoch.reshape(shape)
@@ -577,32 +537,18 @@ class General_RSSM(nj.Module):
 
     # Model dim encoder
     x = self.get('img_in', Linear, **self._kw)(x)
-    init_fn = self.init_ssm(x.shape[0])
-    ssm_args = {'init_fn': init_fn, 'n_layers': self.n_layers, 'dropout': self.dropout, 'd_model': self.d_model,
-      'act': self.act, 'prenorm': self.prenorm, 'batchnorm': self.batchnorm, 'bn_momentum': self.bn_momentum}
-
-    # Inputs come in as different batch size, so we reshape to still use vmap() instead of looping
-    # prep_seq = lambda x: x[:, None, :]
-    # x = prep_seq(x)
-    # deter = prep_seq(prev_state['deter'])
-    # repeat_batch = lambda x: jnp.repeat(x[None, :], bz, 0)
-    # x = repeat_batch(x)
-    # deter = repeat_batch(prev_state['deter'])
-
+    deter = prev_state['hidden_re'] + 1j*prev_state['hidden_im']
     # Inference step with SSM
-    deter = prev_state['deter']
-    out, deter = self.get('ssm', StackedSSM, **ssm_args)(x=x, state=deter, mode='step')
-
+    out, deter = self.get('ssm', StackedSSM, **self.ssm_args)(x=x, state=deter, mode='step')
     # 1. Calculate the prior
     x = self.get('img_out', Linear, **self._kw)(out)
     stats = self._stats('img_stats', x)
     dist = self.get_dist(stats)
     stoch = dist.sample(seed=nj.rng())
-    prior = {'stoch': stoch, 'deter': deter, **stats}
-    # prior = {'stoch': stoch, 'deter': out, **stats}
-    # return cast(prior)
-    return prior
-  
+    prior = {'stoch': stoch, 'deter': out, 'hidden_re': deter.real, 'hidden_im': deter.imag, **stats}
+    return cast(prior)
+
+
 
   def get_dist(self, state, argmax=False):
     if self._classes:

@@ -50,6 +50,7 @@ class Agent(nj.Module):
     return self.wm.initial(batch_size)
 
   def policy(self, obs, state, mode='train'):
+    raise Exception('policy ckpt')
     self.config.jax.jit and print('Tracing policy function.')
     obs = self.preprocess(obs)
     (prev_latent, prev_action), task_state, expl_state = state
@@ -125,8 +126,7 @@ class WorldModel(nj.Module):
     shapes = {k: tuple(v.shape) for k, v in obs_space.items()}
     shapes = {k: v for k, v in shapes.items() if not k.startswith('log_')}
     self.encoder = nets.MultiEncoder(shapes, **config.encoder, name='enc')
-    print(config.ssm)
-    if config.ssm=='s5':  # set true to use deep-ssm backbone
+    if config.ssm != '':  # set true to use deep-ssm backbone
       self.rssm = generalized_ssm.General_RSSM(**config.s5, **config.rssm, name='rssm')
     else: 
       self.rssm = nets.RSSM(**config.rssm, name='rssm')
@@ -188,19 +188,46 @@ class WorldModel(nj.Module):
     keys = list(self.rssm.initial(1).keys())
     start = {k: v for k, v in start.items() if k in keys}
     start['action'] = policy(start)
+
+    # def step(prev, _):
+    #   prev = prev.copy()
+    #   state = self.rssm.img_step(prev, prev.pop('action'))
+    #   return {**state, 'action': policy(state)}
+    # traj = jaxutils.scan(
+    #     step, jnp.arange(horizon), start, self.config.imag_unroll)
+    # traj = {
+    #     k: jnp.concatenate([start[k][None], v], 0) for k, v in traj.items()}
+
     def step(prev, _):
       prev = prev.copy()
       state = self.rssm.img_step(prev, prev.pop('action'))
       return {**state, 'action': policy(state)}
-    traj = jaxutils.scan(
-        step, jnp.arange(horizon), start, self.config.imag_unroll)
-    traj = {
-        k: jnp.concatenate([start[k][None], v], 0) for k, v in traj.items()}
+    inputs = jnp.arange(horizon)
+    length = len(jax.tree_util.tree_leaves(inputs)[0])
+    carrydef = jax.tree_util.tree_structure(start)
+    carry = start
+    outs = []
+    fn2 = lambda carry,input: (step(carry,input),)*2
+    for i in range(length):
+      carry, out = fn2(carry, tree_map(lambda x: x[i], inputs))
+      flat, treedef = jax.tree_util.tree_flatten(out)
+      print(flat)
+      outs.append(flat)
+      raise Exception('img ckpt')
+    traj = jax.tree_util.tree_unflatten(treedef, outs)
+    print(traj)
+    for k,v in traj.items():
+      print(f'{k}: {v.shape}')
+
+
+
+
     cont = self.heads['cont'](traj).mode()
     traj['cont'] = jnp.concatenate([first_cont[None], cont[1:]], 0)
     discount = 1 - 1 / self.config.horizon
     traj['weight'] = jnp.cumprod(discount * traj['cont'], 0) / discount
     return traj
+  
 
   def report(self, data):
     state = self.initial(len(data['is_first']))

@@ -25,4 +25,6 @@ python ${home}/world-SSMs/main.py \
     --run.eval_every 1e6 \
     --batch_size 16 \
     --imag_horizon 15 \
-    --ssm s5
+    --ssm s5 \
+    --rssm.initial zeros
+

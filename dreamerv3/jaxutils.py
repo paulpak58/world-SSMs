@@ -389,18 +389,19 @@ class Optimizer(nj.Module):
     metrics = {}
     loss, params, grads, aux = nj.grad(
         wrapped, modules, has_aux=True)(*args, **kwargs)
+    for k,v in params.items():
+      print(f' {k}: {v}')
     # if not self.PARAM_COUNTS[self.path]:
-      # print(f'param values {params.values()}')
-      # count = sum([np.prod(x.shape) for x in params.values()])
-      # print(f'Optimizer {self.name} has {count:,} variables.')
-      # rssms_cnt = []
-      # print(f'Model keys: {params.keys()}')
-      # for k, v in params.items():
-      #   s = k.split('/')[2]
-      #   if s=='rssm':
-      #     rssms_cnt.append(np.prod(v.shape))
-      # print(f'RSSM has {sum(rssms_cnt):,} variables.') if sum(rssms_cnt)!=0 else None
-      # self.PARAM_COUNTS[self.path] = count
+    #   count = sum([np.prod(x.shape) for x in params.values()])
+    #   print(f'Optimizer {self.name} has {count:,} variables.')
+    #   rssms_cnt = []
+    #   print(f'Model keys: {params.keys()}')
+    #   for k, v in params.items():
+    #     s = k.split('/')[2]
+    #     if s=='rssm':
+    #       rssms_cnt.append(np.prod(v.shape))
+    #   print(f'RSSM has {sum(rssms_cnt):,} variables.') if sum(rssms_cnt)!=0 else None
+    #   self.PARAM_COUNTS[self.path] = count
     if parallel():
       grads = tree_map(lambda x: jax.lax.pmean(x, 'i'), grads)
     if self.scaling:
