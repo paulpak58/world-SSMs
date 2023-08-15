@@ -9,7 +9,13 @@ from . import jaxutils
 from . import ninjax as nj
 from . import nets
 
-from initializers import make_DPLR_HiPPO
+
+from initializers import make_DPLR_HiPPO, init_VinvB, trunc_standard_normal, init_CV, mimo_log_step_initializer
+from jax.nn.initializers import lecun_normal, normal
+from discretization import discretize_zoh, discretize_bilinear
+from scan import apply_ssm
+
+
 from s5 import S5LayerInit
 from s4 import S4LayerInit
 from dss import DSSLayerInit
@@ -22,11 +28,154 @@ cast = jaxutils.cast_to_compute
 Linear = nets.Linear
 
 
-SSM_MODELS = {
-  's4': S4LayerInit,
-  'dss': DSSLayerInit,
-  's5': S5LayerInit
-}
+
+###############################
+# Ninjax implementation of S5 Layer
+###############################
+class NinjaxS5Layer(nj.Module):
+
+
+  #########################################################
+  # Initialize params once, Perform discretization each step
+  #########################################################
+  def __init__(self, blocks:int, init_block_size:int, H:int, P:int,
+    C_init:str, discretization:str, dt_min:float, dt_max:float, conj_sym:bool=True, clip_eigs:bool=False, bidirectional:bool=False, step_rescale:float=1.0
+  ):
+    self.blocks = blocks
+    self.init_block_size = init_block_size
+    self.H = H
+    self.P = P
+    self.C_init = C_init
+    self.discretization = discretization
+    self.dt_min = dt_min
+    self.dt_max = dt_max
+    self.conj_sym = conj_sym
+    self.clip_eigs = clip_eigs
+    self.bidirectional = bidirectional
+    self.step_rescale = step_rescale
+    
+
+    # Initialize DPLR HiPPO matrix
+    Lambda, _, B, V, B_orig = make_DPLR_HiPPO(self.init_block_size)
+    block_size = self.init_block_size//2 if self.conj_sym else self.init_block_size # conj. pairs halve the state space
+    Lambda = Lambda[:block_size]
+    V = V[:, :block_size]
+    Vc = V.conj().T
+
+    # Put each HiPPO on each block diagonal
+    Lambda = (Lambda * jnp.ones((self.blocks, block_size))).ravel()
+    V = jax.scipy.linalg.block_diag(*[V]*self.blocks)
+    Vinv = jax.scipy.linalg.block_diag(*[Vc]*self.blocks)
+
+    self.Lambda_re, self.Lambda_im = Lambda.real, Lambda.imag
+    self.V, self.Vinv = V, Vinv
+    if self.clip_eigs:
+      self.Lambda = jnp.clip(self.Lambda_re, None, -1e-4) + 1j*self.Lambda_im
+    else:
+      self.Lambda = self.Lambda_re + 1j*self.Lambda_im
+
+    local_P = 2*self.P if self.conj_sym else self.P
+    B_init = lecun_normal()
+    B_shape = (local_P, self.H)
+    self.B = init_VinvB(B_init, nj.rng(), B_shape, self.Vinv)
+    # self.B = self.get('B', lambda rng, shape: init_VinvB(B_init, rng, shape, self.Vinv), B_shape)
+    B_tilde = self.B[..., 0] + 1j*self.B[..., 1]
+
+
+    if self.C_init in ['trunc_standard_normal']:
+      C_init = trunc_standard_normal
+      C_shape = (self.H, local_P, 2)
+    elif self.C_init in ['lecun_normal']:
+      C_init = lecun_normal()
+      C_shape = (self.H, local_P, 2)
+    elif self.C_init in ['complex_normal']:
+      C_init = jax.nn.initializers.normal(stddev=0.5**0.5)
+    else:
+      raise NotImplementedError(f'C_init method {self.C_init} not implemented')
+    if self.C_init in ['complex_normal']:
+      if self.bidirectional:
+        # C = self.get('C', C_init, (self.H, 2*self.P, 2))
+        C = C_init((self.H, 2*self.P, 2), name='C')
+        self.C_tilde = C[..., 0] + 1j*C[..., 1]
+      else:
+        C = C_init((self.H, self.P, 2), name='C')
+        self.C_tilde = C[..., 0] + 1j*C[..., 1]
+    else:
+      if self.bidirectional:
+        self.C1 = init_CV(C_init, nj.rng(), C_shape, self.V)
+        self.C2 = init_CV(C_init, nj.rng(), C_shape, self.V)
+        C1 = self.C1[..., 0] + 1j*self.C1[..., 1]
+        C2 = self.C2[..., 0] + 1j*self.C2[..., 1]
+        self.C_tilde = jnp.concatenate((C1, C2), axis=-1)
+      else:
+        self.C = init_CV(C_init, nj.rng(), C_shape, self.V)
+        self.C_tilde = self.C[..., 0] + 1j*self.C[..., 1]
+    # self.D = self.get('D', jax.nn.initializers.normal(stddev=1.0), (self.H,))
+    self.D = normal(stddev=1.0)(nj.rng(), (self.H,))
+
+    # self.log_step = self.get('log_step', mimo_log_step_initializer, (self.P, self.dt_min, self.dt_max))
+    self.log_step = mimo_log_step_initializer(nj.rng(), (self.P, self.dt_min, self.dt_max))
+    step = self.step_rescale * jnp.exp(self.log_step[:, 0])
+
+    # Discretization
+    if self.discretization in ['zoh']:
+      self.Lambda_bar,  self.B_bar = discretize_zoh(self.Lambda, B_tilde, step)
+    elif self.discretization in ['bilinear']:
+      self.Lambda_bar,  self.B_bar = discretize_bilinear(self.Lambda, B_tilde, step)
+    else:
+      raise NotImplementedError(f'Discretization method {self.discretization} not implemented')
+    # RNN cache to store the internal states
+    # self.x_k_1 = self.variable('cache', 'cache_x_k', jnp.zeros, (self.P,), jnp.complex64)
+
+
+  def ssm_forward(self, input_sequence):
+    # batched_ssm = jax.vmap(apply_ssm, in_axes=(0, 0, 0, 0, None, None), out_axes=0)
+    ys, state = apply_ssm(self.Lambda_bar, self.B_bar, self.C_tilde, input_sequence, self.conj_sym, self.bidirectional)
+
+    # if self.is_mutable_collection('cache'):
+    #   self.x_k_1.value = state
+    Du = jax.vmap(lambda u: self.D*u)(input_sequence)
+    out = ys + Du
+    return out, state
+
+  def __call__(self, batched_input_sequence):
+    # outs = []
+    # states = []
+    # for batch in batched_input_sequence:
+    #   out, state = self.ssm_forward(batch)
+    #   outs.append(out)
+    #   states.append(state)
+    # return jnp.stack(outs), jnp.stack(states)
+  
+    def ssm_sequence(self, input_sequence):
+      return apply_ssm(self.Lambda_bar, self.B_bar, self.C_tilde, input_sequence, self.conj_sym, self.bidirectional)
+
+    ys, state = jax.vmap(
+      lambda u: apply_ssm(self.Lambda_bar, self.B_bar, self.C_tilde, u, self.conj_sym, self.bidirectional),
+      in_axes=0, out_axes=0)(batched_input_sequence) 
+
+    # if self.is_mutable_collection('cache'):
+    #   self.x_k_1.value = state
+    Du = jax.vmap(
+      lambda u: self.D*u,
+      in_axes=0, out_axes=0)(batched_input_sequence)
+
+    out = ys + Du
+    return out, state
+
+
+  def step(self, input, prev_state):
+    x_k = self.Lambda_bar @ prev_state + self.B_bar @ input
+    y_k = (self.C_tilde @ x_k).real + self.D * input
+    return y_k, x_k
+
+
+  
+
+
+
+
+
 
 
 def build_ssm(config):
@@ -57,27 +206,75 @@ def masked_meanpool(x, lengths):
   return jnp.sum(mask[...,None]*x, axis=0)/lengths
 
 
-class NJGeneralSequenceLayer(nj.Module):
-  ssm: nn.Module
-  dropout: float
-  d_model: int
-  activation: str='gelu'
-  training: bool=True
-  prenorm: bool=False
-  batchnorm: bool=False
-  bn_momentum: float=0.9
-  step_rescale: float=1.0
 
-  def __init__(self, ssm):
-    raise NotImplementedError
+class FlaxUnfrozen(nj.Module):
+
+  def __init__(self, ctor, *args, **kwargs):
+    self.module = ctor(*args, **kwargs)
+    # self.batchnorm = kwargs['batchnorm']
+
+  def __call__(self, *args, **kwargs):
+    state = self.get('state', self.module.init, nj.rng(), *args, **kwargs)
+    # if self.batchnorm:
+    #   params = state['params'].unfreeze()
+    #   batch_stats = state['batch_stats']
+    # else:
+    params = state['params'].unfreeze()
+    params = {'params': params}
+    return self.module.apply(params, *args, **kwargs)
+
+
+
+class NJGeneralSequenceLayer(nj.Module):
+
+  def __init__(self, ssm: nj.Module, dropout: float, d_model: int,
+      activation: str='gelu', training: bool=True, prenorm: bool=False,
+      batchnorm: bool=False, bn_momentum: float=0.9, step_rescale: float=1.0, **layer_args):
+    self.seq = ssm
+    self.dropout = dropout
+    self.d_model = d_model
+    self.activation = activation
+    self.training = training
+    self.prenorm = prenorm
+    self.batchnorm = batchnorm
+    self.bn_momentum = bn_momentum
+    self.step_rescale = step_rescale
+
+    self.layer_args = layer_args
+    
+    # self.seq = FlaxUnfrozen(self.ssm, step_rescale=self.step_rescale, name='ssm')
+    # if self.activation in ['full_glu']:
+    #   self.out1 = nn.Dense(self.d_model)
+    #   self.out2 = nn.Dense(self.d_model)
+    # elif self.activation in ['half_glu1', 'half_glu2']:
+    #   self.out2 = nn.Dense(self.d_model)
+    # if self.batchnorm:
+    #   self.norm = nn.BatchNorm(use_running_average=not self.training, momentum=self.bn_momentum, axis_name='batch')
+    # else:
+    #   # self.norm = nj.FlaxModule(nn.LayerNorm, name='norm')
+    #   self.norm = FlaxUnfrozen(nn.LayerNorm, name='norm')
+    # self.drop = nn.Dropout(
+    #   self.dropout,
+    #   broadcast_dims=[0],
+    #   deterministic=not self.training
+    # )
+
 
   def __call__(self, x, state, scan):
     # Takes in (L, d_model) and outputs (L, d_model)
+
     skip = x
     if self.prenorm:
-      x = self.norm(x)
+      # x = self.norm(x)
+      x = self.get('norm', nets.Norm, 'layer')(x)
     if scan is not None: 
-      x, state = self.seq(x)
+      # x, state = self.seq(x)
+      # from s5 import NinjaxS5Layer
+      init = jax.nn.initializers.variance_scaling(1, 'fan_avg', 'uniform')
+      weights = self.get('weights', init, nj.rng(), (64, 32))   # This nj.rng() works but not in NinjaxS5Layer
+      x, state = self.get('ssm', NinjaxS5Layer, **self.layer_args)(x)
+      # x, state = self.get('ssm', self.seq).scan(x)
+      # x, state = self.seq(x, state)
     else:
       x, state = self.seq.step(x, state)
     if self.activation in ['full_glu']:
@@ -94,12 +291,14 @@ class NJGeneralSequenceLayer(nj.Module):
       x = x * jax.nn.sigmoid(self.out2(x1))
       x = self.drop(x)
     elif self.activation in ['gelu']:
-      x = self.drop(nn.gelu(x))
+      # x = self.drop(nn.gelu(x))
+      x = nn.gelu(x)
     else:
       raise NotImplementedError(f'Activation {self.activation} not implemented')
     x = skip + x
     if not self.prenorm:
-      x = self.norm(x)
+      # x = self.norm(x)
+      x = self.get('norm', nets.Norm, 'layer')(x)
     # cache_val = self.seq.x_k_1.value
     return x, state
 
@@ -121,7 +320,9 @@ class GeneralSequenceLayer(nn.Module):
   step_rescale: float=1.0
 
   def setup(self):
-    self.seq = self.ssm(step_rescale=self.step_rescale)
+    # self.seq = self.ssm(step_rescale=self.step_rescale)
+    # self.seq = nj.FlaxModule(self.ssm, step_rescale=self.step_rescale, name='ssm')
+    self.seq = FlaxUnfrozen(self.ssm, step_rescale=self.step_rescale, name='ssm')
     if self.activation in ['full_glu']:
       self.out1 = nn.Dense(self.d_model)
       self.out2 = nn.Dense(self.d_model)
@@ -130,7 +331,8 @@ class GeneralSequenceLayer(nn.Module):
     if self.batchnorm:
       self.norm = nn.BatchNorm(use_running_average=not self.training, momentum=self.bn_momentum, axis_name='batch')
     else:
-      self.norm = nn.LayerNorm()
+      # self.norm = nj.FlaxModule(nn.LayerNorm, name='norm')
+      self.norm = FlaxUnfrozen(nn.LayerNorm, name='norm')
     self.drop = nn.Dropout(
       self.dropout,
       broadcast_dims=[0],
@@ -179,7 +381,7 @@ class GeneralSequenceLayer(nn.Module):
 class StackedSSM(nj.Module):
     
     def __init__(
-      self, init_fn, n_layers, dropout, d_model, act, prenorm, batchnorm, bn_momentum
+      self, init_fn, n_layers, dropout, d_model, act, prenorm, batchnorm, bn_momentum, **layer_args
     ):
       seq_layer = GeneralSequenceLayer(
         ssm=init_fn, dropout=dropout, d_model=d_model, activation=act,
@@ -194,20 +396,24 @@ class StackedSSM(nj.Module):
       self.prenorm = prenorm
       self.batchnorm = batchnorm
       self.bn_momentum = bn_momentum
+      self.layer_args = layer_args
 
     def __call__(self, x, state=None, mode='scan'):
       # format it as batch for vmap
       scan = jnp.ones((x.shape[0]), dtype=jnp.int32) if mode=='scan' else None
       for l in range(self.n_layers):
-        # x, state = nj.FlaxModule(
-        #   GeneralSequenceLayer, ssm=self.init_fn, dropout=self.dropout, d_model=self.d_model, activation=self.act,
+        # x, state = BatchedSequenceLayer(
+        #   ssm=self.init_fn, dropout=self.dropout, d_model=self.d_model, activation=self.act,
         #   prenorm=self.prenorm, batchnorm=self.batchnorm, bn_momentum=self.bn_momentum,
         #   name=f'layer_{l}'
-        # )(x, state)
-        x, state = nj.FlaxModule(
-          BatchedSequenceLayer, ssm=self.init_fn, dropout=self.dropout, d_model=self.d_model, activation=self.act,
-          prenorm=self.prenorm, batchnorm=self.batchnorm, bn_momentum=self.bn_momentum,
-          name=f'layer_{l}'
+        # )(x, state, scan)
+        # x, state = GeneralSequenceLayer(
+        #   ssm=self.init_fn, dropout=self.dropout, d_model=self.d_model, activation=self.act,
+        #   prenorm=self.prenorm, batchnorm=self.batchnorm, bn_momentum=self.bn_momentum
+        # )(x, state, scan)
+        x, state = self.get(f'layer_{l}', NJGeneralSequenceLayer,
+          ssm=self.init_fn, dropout=self.dropout, d_model=self.d_model, activation=self.act,
+          prenorm=self.prenorm, batchnorm=self.batchnorm, bn_momentum=self.bn_momentum, **self.layer_args
         )(x, state, scan)
       return x, state
 
@@ -293,12 +499,21 @@ BatchedSequenceModel= nn.vmap(
 #   axis_name='batch'
 # )
 BatchedSequenceLayer = nn.vmap(
-  GeneralSequenceLayer,
+  NJGeneralSequenceLayer,
   in_axes=0,
   out_axes=0,
   variable_axes={'params':None, 'dropout':None, 'cache':0, 'prime':None},
   split_rngs={'params': False, 'dropout': True},
   axis_name='batch'
+)
+
+BatchedSSM = jax.vmap(
+  StackedSSM,
+  in_axes=0,
+  out_axes=0,
+  # variable_axes={'params':None, 'dropout':None, 'cache':0, 'prime':None},
+  # split_rngs={'params': False, 'dropout': True},
+  # axis_name='batch'
 )
 
 
@@ -350,10 +565,13 @@ class General_RSSM(nj.Module):
     self.bn_momentum = bn_momentum
 
     # Calling this function instantiates a single layer
+    SSM_MODELS = {'s4': S4LayerInit, 'dss': DSSLayerInit, 's5': S5LayerInit }
     init_fn = SSM_MODELS[self.ssm](
       blocks=self.blocks, init_block_size=self.init_block_size, H=self.d_model, P=self.ssm_size, C_init=self.C_init, discretization=self.discretization,
       dt_min=self.dt_min, dt_max=self.dt_max, conj_sym=self.conj_sym, clip_eigs=self.clip_eigs, bidirectional=self.bidirectional, 
     )
+    self.layer_args = {'blocks': self.blocks, 'init_block_size': self.init_block_size, 'H': self.d_model, 'P': self.ssm_size, 'C_init': self.C_init,
+      'discretization': self.discretization, 'dt_min': self.dt_min, 'dt_max': self.dt_max, 'conj_sym': self.conj_sym,'clip_eigs': self.clip_eigs,'bidirectional': self.bidirectional}
     self.ssm_args = {'init_fn': init_fn, 'n_layers': self.n_layers, 'dropout': self.dropout, 'd_model': self.d_model,
       'act': self.act, 'prenorm': self.prenorm, 'batchnorm': self.batchnorm, 'bn_momentum': self.bn_momentum}
 
@@ -440,7 +658,8 @@ class General_RSSM(nj.Module):
     full_bz = x.shape[0]*x.shape[1]
     dummy_in = jnp.zeros((full_bz, x.shape[-2], x.shape[-1]), f32)
     expanded_x = dummy_in.at[:x.shape[0]].set(x)
-    expanded_out, expanded_deter = self.get('ssm', StackedSSM, **self.ssm_args)(expanded_x, state=None)
+    expanded_out, expanded_deter = self.get('ssm', StackedSSM, **self.ssm_args, **self.layer_args)(expanded_x, state=None)
+    # expanded_out, expanded_deter = self.get('ssm', BatchedSSM, **self.ssm_args, **self.layer_args)(expanded_x, state=None)
     out = expanded_out[:x.shape[0]]
     deter = expanded_deter[:x.shape[0]]
 
@@ -460,10 +679,14 @@ class General_RSSM(nj.Module):
     # post = {'stoch': stoch, 'deter': prior['deter'], 'hidden': prior['hidden'], **stats}
     post = cast({'stoch': stoch, 'deter': prior['deter'], 'hidden_re': prior['hidden_re'], 'hidden_im': prior['hidden_im'], **stats})
 
+
+    raise Exception('end of obs')
+
     return post, prior
   
 
   def imagine(self, action, state=None):
+    raise Exception('imagine')
     swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
     state = self.initial(action.shape[0]) if state is None else state
     assert isinstance(state, dict), state

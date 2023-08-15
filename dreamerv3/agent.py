@@ -20,6 +20,7 @@ from . import ninjax as nj
 from . import generalized_ssm
 
 
+
 @jaxagent.Wrapper
 class Agent(nj.Module):
 
@@ -80,6 +81,7 @@ class Agent(nj.Module):
     metrics = {}
     data = self.preprocess(data)
     state, wm_outs, mets = self.wm.train(data, state)
+    print(f'metrics for world model train {mets}') #TODO
     metrics.update(mets)
     context = {**data, **wm_outs['post']}
     start = tree_map(lambda x: x.reshape([-1] + list(x.shape[2:])), context)
@@ -92,6 +94,7 @@ class Agent(nj.Module):
     return outs, state, metrics
 
   def report(self, data):
+    raise Exception('report')
     self.config.jax.jit and print('Tracing report function.')
     data = self.preprocess(data)
     report = {}
@@ -127,7 +130,7 @@ class WorldModel(nj.Module):
     shapes = {k: v for k, v in shapes.items() if not k.startswith('log_')}
     self.encoder = nets.MultiEncoder(shapes, **config.encoder, name='enc')
     if config.ssm != '':  # set true to use deep-ssm backbone
-      self.rssm = generalized_ssm.General_RSSM(**config.s5, **config.rssm, name='rssm')
+      self.rssm = generalized_ssm.General_RSSM(**config.s5, **config.rssm, name='s5')
     else: 
       self.rssm = nets.RSSM(**config.rssm, name='rssm')
     self.heads = {
@@ -189,38 +192,37 @@ class WorldModel(nj.Module):
     start = {k: v for k, v in start.items() if k in keys}
     start['action'] = policy(start)
 
-    # def step(prev, _):
-    #   prev = prev.copy()
-    #   state = self.rssm.img_step(prev, prev.pop('action'))
-    #   return {**state, 'action': policy(state)}
-    # traj = jaxutils.scan(
-    #     step, jnp.arange(horizon), start, self.config.imag_unroll)
-    # traj = {
-    #     k: jnp.concatenate([start[k][None], v], 0) for k, v in traj.items()}
-
     def step(prev, _):
       prev = prev.copy()
       state = self.rssm.img_step(prev, prev.pop('action'))
       return {**state, 'action': policy(state)}
-    inputs = jnp.arange(horizon)
-    length = len(jax.tree_util.tree_leaves(inputs)[0])
-    carrydef = jax.tree_util.tree_structure(start)
-    carry = start
-    outs = []
-    fn2 = lambda carry,input: (step(carry,input),)*2
-    for i in range(length):
-      carry, out = fn2(carry, tree_map(lambda x: x[i], inputs))
-      flat, treedef = jax.tree_util.tree_flatten(out)
-      print(flat)
-      outs.append(flat)
-      raise Exception('img ckpt')
-    traj = jax.tree_util.tree_unflatten(treedef, outs)
-    print(traj)
-    for k,v in traj.items():
-      print(f'{k}: {v.shape}')
+    traj = jaxutils.scan(
+        step, jnp.arange(horizon), start, self.config.imag_unroll)
+    traj = {
+        k: jnp.concatenate([start[k][None], v], 0) for k, v in traj.items()}
 
-
-
+    # def step(prev, _):
+    #   prev = prev.copy()
+    #   state = self.rssm.img_step(prev, prev.pop('action'))
+    #   return {**state, 'action': policy(state)}
+    # inputs = jnp.arange(horizon)
+    # length = len(jax.tree_util.tree_leaves(inputs)[0])
+    # carrydef = jax.tree_util.tree_structure(start)
+    # carry = start
+    # outs = []
+    # fn2 = lambda carry,input: (step(carry,input),)*2
+    # for i in range(length):
+    #   carry, out = fn2(carry, tree_map(lambda x: x[i], inputs))
+    #   flat, treedef = jax.tree_util.tree_flatten(out)
+    #   assert treedef==carrydef
+    #   outs.append(flat)
+    # outs = [
+    #     jnp.stack([carry[i] for carry in outs], 0)
+    #     for i in range(len(outs[0]))]
+    # # print(f'outs shape {len(outs)}')
+    # traj = carrydef.unflatten(outs)
+    # # traj = jax.tree_util.tree_unflatten(treedef, outs)
+    # traj = {k: jnp.concatenate([start[k][None], v], 0) for k, v in traj.items()}
 
     cont = self.heads['cont'](traj).mode()
     traj['cont'] = jnp.concatenate([first_cont[None], cont[1:]], 0)
