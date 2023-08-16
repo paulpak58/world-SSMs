@@ -51,7 +51,6 @@ class Agent(nj.Module):
     return self.wm.initial(batch_size)
 
   def policy(self, obs, state, mode='train'):
-    raise Exception('policy ckpt')
     self.config.jax.jit and print('Tracing policy function.')
     obs = self.preprocess(obs)
     (prev_latent, prev_action), task_state, expl_state = state
@@ -94,7 +93,6 @@ class Agent(nj.Module):
     return outs, state, metrics
 
   def report(self, data):
-    raise Exception('report')
     self.config.jax.jit and print('Tracing report function.')
     data = self.preprocess(data)
     report = {}
