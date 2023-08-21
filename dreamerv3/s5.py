@@ -1,4 +1,3 @@
-
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
@@ -7,11 +6,10 @@ from jax.nn.initializers import lecun_normal, normal
 
 from . import ninjax as nj
 
-from discretization import discretize_zoh, discretize_bilinear
-from scan import apply_ssm
+from .discretization import discretize_zoh, discretize_bilinear
+from scan import apply_ssm, apply_ssm_state
 from initializers import init_VinvB, init_CV, mimo_log_step_initializer, trunc_standard_normal
 from initializers import make_DPLR_HiPPO
-
 
 
 ###############################
@@ -58,7 +56,7 @@ class NinjaxS5Layer(nj.Module):
     V = V[:, :block_size]
     Vc = V.conj().T
 
-    # Put each HiPPO on each block diagonal
+    # # Put each HiPPO on each block diagonal
     Lambda = (Lambda * jnp.ones((self.blocks, block_size))).ravel()
     V = jax.scipy.linalg.block_diag(*[V]*self.blocks)
     Vinv = jax.scipy.linalg.block_diag(*[Vc]*self.blocks)
@@ -66,6 +64,13 @@ class NinjaxS5Layer(nj.Module):
     # Initialize state matrix Lambda
     self.Lambda_re = self.get('Lambda_re', lambda rng, shape: Lambda.real, nj.rng(), (None,))
     self.Lambda_im = self.get('Lambda_im', lambda rng, shape: Lambda.imag, nj.rng(), (None,))
+
+    # V = self.get('V', jnp.zeros, (self.H, self.H))
+    # Vinv = self.get('Vinv', jnp.zeros, (self.H, self.H))
+    # self.Lambda_re = self.get('Lambda_re', jnp.zeros, (self.H,))
+    # self.Lambda_im = self.get('Lambda_im', jnp.zeros, (self.H,))
+
+
     self.V, self.Vinv = V, Vinv
     if self.clip_eigs:
       self.Lambda = jnp.clip(self.Lambda_re, None, -1e-4) + 1j*self.Lambda_im
@@ -121,31 +126,38 @@ class NinjaxS5Layer(nj.Module):
       self.Lambda_bar,  self.B_bar = discretize_bilinear(self.Lambda, B_tilde, step)
     else:
       raise NotImplementedError(f'Discretization method {self.discretization} not implemented')
+
     # RNN cache to store the internal states
     # self.x_k_1 = self.variable('cache', 'cache_x_k', jnp.zeros, (self.P,), jnp.complex64)
 
 
-  def ssm_forward(self, input_sequence):
-    # batched_ssm = jax.vmap(apply_ssm, in_axes=(0, 0, 0, 0, None, None), out_axes=0)
-    ys, state = apply_ssm(self.Lambda_bar, self.B_bar, self.C_tilde, input_sequence, self.conj_sym, self.bidirectional)
-
+  def __call__(self, batched_input_sequence, state, train=True):
     # if self.is_mutable_collection('cache'):
     #   self.x_k_1.value = state
-    Du = jax.vmap(lambda u: self.D*u)(input_sequence)
-    out = ys + Du
+    if train:
+      # ys, state = jax.vmap(
+      #   lambda u: apply_ssm(self.Lambda_bar, self.B_bar, self.C_tilde, u, self.conj_sym, self.bidirectional),
+      #   in_axes=0, out_axes=0)(batched_input_sequence) 
+      ys, state = jax.vmap(
+        lambda x, u: apply_ssm_state(x, u, self.Lambda_bar, self.B_bar, self.C_tilde, self.conj_sym, self.bidirectional),
+        in_axes=0, out_axes=0)(state, batched_input_sequence) 
+      Du = jax.vmap(
+        lambda u: self.D*u,
+        in_axes=0, out_axes=0)(batched_input_sequence)
+      out = ys + Du
+    else:
+      prev_state = state
+      x_k = jax.vmap(
+        lambda prev_state, u: self.Lambda_bar @ prev_state + self.B_bar @ u,
+        in_axes=0, out_axes=0)(prev_state, batched_input_sequence)
+      y_k = jax.vmap(
+        lambda x_k, u: (self.C_tilde @ x_k).real + self.D * u,
+        in_axes=0, out_axes=0)(x_k, batched_input_sequence)
+      # y_k = (self.C_tilde @ x_k).real + self.D * input
+      out, state = y_k, x_k
     return out, state
 
-  def __call__(self, batched_input_sequence):
-    # if self.is_mutable_collection('cache'):
-    #   self.x_k_1.value = state
-    ys, state = jax.vmap(
-      lambda u: apply_ssm(self.Lambda_bar, self.B_bar, self.C_tilde, u, self.conj_sym, self.bidirectional),
-      in_axes=0, out_axes=0)(batched_input_sequence) 
-    Du = jax.vmap(
-      lambda u: self.D*u,
-      in_axes=0, out_axes=0)(batched_input_sequence)
-    out = ys + Du
-    return out, state
+
 
   def step(self, input, prev_state):
     x_k = jax.vmap(

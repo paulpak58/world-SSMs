@@ -1,9 +1,10 @@
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from functools import partial  
+from functools import partial
+from . import ninjax as nj 
 
-from initializers import log_step_initializer
+from initializers import log_step_initializer, make_DPLR_HiPPO
 from discretization import discrete_DPLR
 from kernels import kernel_DPLR, causal_convolution
 from scan import scan_SSM
@@ -22,6 +23,60 @@ def S4LayerInit(
 
 
 ###############################
+# Ninjax implementation of S4 Layer
+###############################
+class S4Layer(nj.Module):
+
+  def __init__(self, N:int, l_max, clip_eigs:bool=True):
+
+    Lambda, P, B, _, _ = make_DPLR_HiPPO(N)
+    # Initialize state matrix Lambda
+    self.Lambda_re = self.get('Lambda_re', lambda rng, shape: Lambda.real, nj.rng(), (None,))
+    self.Lambda_im = self.get('Lambda_im', lambda rng, shape: Lambda.imag, nj.rng(), (None,))
+    if self.clip_eigs:
+      self.Lambda = jnp.clip(self.Lambda_re, None, -1e-4) + 1j*self.Lambda_im
+    else:
+      self.Lambda = self.Lambda_re + 1j*self.Lambda_im
+    # P is the low-rank factor
+    self.P = self.get('P', lambda rng, shape: P, nj.rng(), (None,))
+    self.B = self.get('B', lambda rng, shape: B, nj.rng(), (None,))
+
+    # need to recompose C in call since jax optimizers don't work well with complex numbers
+    self.C = self.get('C', jax.nn.initializers.normal(stddev=0.5**0.5), (N, 2))
+    # self.C = self.C[...,0] + 1j*self.C[...,1]
+    self.D = self.get('D', jax.nn.initializers.ones, (1,))
+    self.step = jnp.exp(self.get('log_step', log_step_initializer(), (1,)))
+
+
+    # Used for efficient parallelization during world model training
+    self.K = kernel_DPLR(
+      self.Lambda, self.P, self.P, self.B, self.C, self.step, self.l_max
+    )
+    # RNN step is used for agent training (world model evaluation)
+    self.A, self.B, self.C = discrete_DPLR(
+      self.Lambda, self.P, self.P, self.B, self.C, self.step, self.l_max
+    )
+
+  def __call__(self, batched_input_sequence, state, train=True):
+    if train:
+      y = jax.vmap(
+        lambda u: causal_convolution(u, self.K) + self.D*u,
+        in_axes=0, out_axes=0)(batched_input_sequence)
+    else:
+      x_k = jax.vmap(
+        lambda prev_state, u: self.Lambda_bar @ prev_state + self.B_bar @ u,
+        in_axes=0, out_axes=0)(prev_state, batched_input_sequence)
+      y_k = jax.vmap(
+        lambda x_k, u: (self.C_tilde @ x_k).real + self.D * u,
+        in_axes=0, out_axes=0)(x_k, batched_input_sequence)
+
+      x_k, y_s = scan_SSM(self.A, self.B, self.C, input_sequence[:jnp.newaxis], state)
+      y = y_s.reshape(-1).real + self.D*input_sequence
+
+
+
+
+###############################
 # Flax implementation of S4 Layer
 ###############################
 class S4Layer(nn.Module):
@@ -36,10 +91,8 @@ class S4Layer(nn.Module):
   clip_eigs: bool=False
 
   def setup(self):
-
     self.Lambda_re = self.param('Lambda_re', lambda rng, shape: self.Lambda_re_init, (None,))
     self.Lambda_im = self.param('Lambda_im', lambda rng, shape: self.Lambda_im_init, (None,))
-
     if self.clip_eigs:
       self.Lambda = jnp.clip(self.Lambda_re, None, -1e-4) + 1j*self.Lambda_im
     else:

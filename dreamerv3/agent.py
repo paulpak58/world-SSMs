@@ -230,6 +230,7 @@ class WorldModel(nj.Module):
   
 
   def report(self, data):
+    raise NotImplementedError('report not implemented')
     state = self.initial(len(data['is_first']))
     report = {}
     report.update(self.loss(data, state)[-1][-1])

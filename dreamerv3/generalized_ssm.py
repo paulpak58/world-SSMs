@@ -11,8 +11,8 @@ from . import nets
 
 # from . import s5_test
 from . import s5
-from . import s4
-from . import dss
+# from . import s4
+# from . import dss
 
 
 f32 = jnp.float32
@@ -24,8 +24,8 @@ Linear = nets.Linear
 
 
 SSM_MODELS = {
-  's4': s4.S4LayerInit,
-  'dss': dss.DSSLayerInit,
+  # 's4': s4.S4LayerInit,
+  # 'dss': dss.DSSLayerInit,
   's5': s5.S5LayerInit
 }
 
@@ -84,15 +84,19 @@ class GeneralSequenceLayer(nj.Module):
     self.drop = nj.FlaxModule(nn.Dropout, dropout, broadcast_dims=[0], deterministic=not training, name='drop')
 
 
-  def __call__(self, x, state, scan):
+  def __call__(self, x, state, mode='train'):
     # Takes in (L, d_model) and outputs (L, d_model)
     skip = x
     if self.prenorm:
       x = self.get('norm', nets.Norm, 'layer')(x)
-    if scan is not None: 
-      x, state = self.get('ssm', self.ssm)(x)
+    if mode=='train':
+      # x, state = self.get('ssm', self.ssm)(x)
+      # x, state = self.get('s5', s5.NinjaxS5Layer, **self.layer_args)(x, state=None, train=True)
+      x, state = self.get('s5', self.ssm)(x, state, train=True)
     else:
-      x, state = self.get('ssm', self.ssm).step(x, state)
+      # x, state = self.get('ssm', self.ssm).step(x, state)
+      x, state = self.get('s5', self.ssm)(x, state, train=False)
+      # x, state = self.get('ssm', self.ssm)(x, state)
     if self.activation in ['full_glu']:
       x = self.drop(nn.gelu(x))
       x = self.out1(x) * jax.nn.sigmoid(self.out2(x))
@@ -128,7 +132,7 @@ class GeneralSequenceLayer(nj.Module):
 class StackedSSM(nj.Module):
     
     def __init__(
-      self, init_fn, n_layers, dropout, d_model, act, prenorm, batchnorm, bn_momentum
+      self, init_fn, n_layers, dropout, d_model, act, prenorm, batchnorm, bn_momentum,
     ):
       self.n_layers = n_layers
       # ssm layer attributes
@@ -140,14 +144,14 @@ class StackedSSM(nj.Module):
       self.batchnorm = batchnorm
       self.bn_momentum = bn_momentum
 
-    def __call__(self, x, state=None, mode='scan'):
+    def __call__(self, x, state=None, mode='train'):
       # format it as batch for vmap
-      scan = jnp.ones((x.shape[0]), dtype=jnp.int32) if mode=='scan' else None
+      # scan = jnp.ones((x.shape[0]), dtype=jnp.int32) if mode=='scan' else None
       for l in range(self.n_layers):
         x, state = self.get(f'layer_{l}', GeneralSequenceLayer,
           ssm=self.init_fn, dropout=self.dropout, d_model=self.d_model, activation=self.act,
-          prenorm=self.prenorm, batchnorm=self.batchnorm, bn_momentum=self.bn_momentum,
-        )(x, state, scan)
+          prenorm=self.prenorm, batchnorm=self.batchnorm, bn_momentum=self.bn_momentum
+        )(x, state, mode)
       return x, state
 
 
@@ -251,6 +255,9 @@ class General_RSSM(nj.Module):
     if state is None:
       state = self.initial(action.shape[0])
 
+    # check if deterministic state is initialized with zeros
+    # assert jnp.all(state['deter']==0), state['deter']
+
     # Make sure that everything is right format and within bounds
     prev_state = state
     is_first = cast(is_first)
@@ -258,17 +265,27 @@ class General_RSSM(nj.Module):
     if self._action_clip > 0.0:
       prev_action *= sg(self._action_clip / jnp.maximum(
           self._action_clip, jnp.abs(prev_action)))
+    print(f'embed shape and action shape {embed.shape} {action.shape}')
+    print(f'is first shape {is_first.shape}')
+    print(f'prev_state shape {prev_state["deter"].shape}')
+    # raise Exception
+    # is first : {16,64}
+    # embed and action : {16,64,dim}
+
+
     # Expand our init variables to match sequence length
-    prev_state = jax.tree_util.tree_map(expand_to_seq, (prev_state))
-    init_seq = jax.tree_util.tree_map(expand_to_seq, (self.initial(len(is_first))))
-    prev_action, prev_state = jax.tree_util.tree_map(   # batched sequence mask
-      lambda x: self._mask_sequence(x, 1.0 - is_first), (prev_action, prev_state))
-    # match type of prev state components
-    prev_state = jax.tree_util.tree_map(
-        lambda x, y: x + self._mask_sequence(y, is_first), prev_state, init_seq) 
+    # prev_state = jax.tree_util.tree_map(expand_to_seq, (prev_state))
+    # init_seq = jax.tree_util.tree_map(expand_to_seq, (self.initial(len(is_first))))
+    # prev_action, prev_state = jax.tree_util.tree_map(   # batched sequence mask
+    #   lambda x: self._mask_sequence(x, 1.0 - is_first), (prev_action, prev_state))
+    # # match type of prev state components
+    # prev_state = jax.tree_util.tree_map(
+    #     lambda x, y: x + self._mask_sequence(y, is_first), prev_state, init_seq) 
+
 
     # 1. Calculate the prior
-    prior = self.imagine(prev_action, prev_state)
+    # prior = self.imagine(prev_action, prev_state)
+    prior = self.action_imagine(prev_action, prev_state)
     # 2. Calculate the posterior
     x = jnp.concatenate([prior['deter'], embed], -1)  # deter component is out of ssm
     x = self.get('obs_out', Linear, **self._kw)(x)
@@ -276,8 +293,23 @@ class General_RSSM(nj.Module):
     dist = self.get_dist(stats)
     stoch = dist.sample(seed=nj.rng())
     post = cast({'stoch': stoch, 'deter': prior['deter'], 'hidden_re': prior['hidden_re'], 'hidden_im': prior['hidden_im'], **stats})
+    raise Exception('obs ckpt')
     return post, prior
   
+  def action_imagine(self, action, prev_state):
+    prev_action = action
+    prev_hidden = prev_state['hidden_re']+1j*prev_state['hidden_im']
+    x = jnp.concatenate([prev_action], -1)
+    x = self.get('img_in', Linear, **self._kw)(x)
+    print(f'shapes prev action prev hidden {prev_action.shape} {prev_hidden.shape}')
+    out, deter = self.get('ssm', StackedSSM, **self.ssm_args)(x, prev_hidden)
+    x = self.get('img_out', Linear, **self._kw)(out)
+    stats = self._stats('img_stats', x)
+    dist = self.get_dist(stats)
+    stoch = dist.sample(seed=nj.rng())
+    prior = cast({'stoch': stoch, 'deter': out, 'hidden_re': deter.real, 'hidden_im': deter.imag, **stats})
+    return cast(prior)
+
 
   def imagine(self, action, state=None):
     swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))

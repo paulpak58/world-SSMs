@@ -2,16 +2,15 @@ import jax
 import jax.numpy as jnp
 from jax import random
 
-import numpy as np
 
 ############################
 # Creates HiPPO-LegS matrix
 ############################
 def _make_HiPPO(N):
   # N is the state size
-  P = np.sqrt(1 + 2*np.arange(N))
-  A = P[:, jnp.newaxis]*P[np.newaxis, :]
-  A = np.tril(A) - np.diag(np.arange(N))
+  P = jnp.sqrt(1 + 2*jnp.arange(N))
+  A = P[:, jnp.newaxis]*P[jnp.newaxis, :]
+  A = jnp.tril(A) - jnp.diag(jnp.arange(N))
   # (N, N) HiPPO LegS matrix
   return -A
 
@@ -22,8 +21,8 @@ def _make_HiPPO(N):
 def _make_NPLR_HiPPO(N):
   # N is the state size
   hippo = _make_HiPPO(N)
-  P = np.sqrt(np.arange(N) + 0.5)
-  B = np.sqrt(2*np.arange(N) + 1.0)
+  P = jnp.sqrt(jnp.arange(N) + 0.5)
+  B = jnp.sqrt(2*jnp.arange(N) + 1.0)
   # (N, N) HiPPO LegS matrix, low-rank factor P, HiPPO input matrix B
   return hippo, P, B
 
@@ -34,11 +33,11 @@ def _make_NPLR_HiPPO(N):
 def make_DPLR_HiPPO(N):
   # N is the state size
   A, P, B = _make_NPLR_HiPPO(N)
-  S = A + P[:, np.newaxis]*P[np.newaxis, :]
-  S_diag = np.diagonal(S)
-  Lambda_real = np.mean(S_diag) + np.ones_like(S_diag)
+  S = A + P[:, jnp.newaxis]*P[jnp.newaxis, :]
+  S_diag = jnp.diagonal(S)
+  Lambda_real = jnp.mean(S_diag) + jnp.ones_like(S_diag)
   # Diagonalize S to V Lambda V^*
-  Lambda_imag, V = np.linalg.eigh(S*-1j)
+  Lambda_imag, V = jnp.linalg.eigh(S*-1j)
   P = V.conj().T@P
   B_orig = B
   B = V.conj().T@B
