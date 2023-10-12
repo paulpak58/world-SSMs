@@ -16,13 +16,14 @@ from initializers import make_DPLR_HiPPO
 # Instantiates a single S5 layer
 ###############################
 def S5LayerInit(
-  blocks, init_block_size, H, P, C_init, discretization, dt_min, dt_max, conj_sym, clip_eigs, bidirectional,
+  blocks, init_block_size, Lambda_re_init, Lambda_im_init, V, Vinv,
+  H, P, C_init, discretization, dt_min, dt_max, conj_sym, clip_eigs, bidirectional,
   name='ssm'
 ):
   # H=d_model, P=ssm_size
   return partial(
-    NinjaxS5Layer, blocks=blocks, init_block_size=init_block_size, H=H, P=P, C_init=C_init, discretization=discretization,
-    dt_min=dt_min, dt_max=dt_max, conj_sym=conj_sym, clip_eigs=clip_eigs, bidirectional=bidirectional,
+    S5, blocks=blocks, init_block_size=init_block_size, Lambda_re_init=Lambda_re_init, Lambda_im_init=Lambda_im_init, V=V, Vinv=Vinv,
+    H=H, P=P, C_init=C_init, discretization=discretization, dt_min=dt_min, dt_max=dt_max, conj_sym=conj_sym, clip_eigs=clip_eigs, bidirectional=bidirectional,
     name=name)
 
 
@@ -30,13 +31,19 @@ def S5LayerInit(
 ###############################
 # Ninjax implementation of S5 Layer
 ###############################
-class NinjaxS5Layer(nj.Module):
+class S5(nj.Module):
 
-  def __init__(self, blocks:int, init_block_size:int, H:int, P:int,
+  def __init__(self, blocks:int, init_block_size:int, 
+    Lambda_re_init:jax.Array, Lambda_im_init:jax.Array, V:jax.Array, Vinv:jax.Array, H:int, P:int,
     C_init:str, discretization:str, dt_min:float, dt_max:float, conj_sym:bool=True, clip_eigs:bool=False, bidirectional:bool=False, step_rescale:float=1.0
   ):
-    self.blocks = blocks
-    self.init_block_size = init_block_size
+    # self.blocks = blocks
+    # self.init_block_size = init_block_size
+    self.Lambda_re_init = Lambda_re_init
+    self.Lambda_im_init = Lambda_im_init
+    self.V = V
+    self.Vinv = Vinv
+
     self.H = H
     self.P = P
     self.C_init = C_init
@@ -48,41 +55,19 @@ class NinjaxS5Layer(nj.Module):
     self.bidirectional = bidirectional
     self.step_rescale = step_rescale
     
+  def __call__(self, batched_input_sequence, init_state):
 
-    # Initialize DPLR HiPPO matrix
-    Lambda, _, B, V, B_orig = make_DPLR_HiPPO(self.init_block_size)
-    block_size = self.init_block_size//2 if self.conj_sym else self.init_block_size # conj. pairs halve the state space
-    Lambda = Lambda[:block_size]
-    V = V[:, :block_size]
-    Vc = V.conj().T
-
-    # # Put each HiPPO on each block diagonal
-    Lambda = (Lambda * jnp.ones((self.blocks, block_size))).ravel()
-    V = jax.scipy.linalg.block_diag(*[V]*self.blocks)
-    Vinv = jax.scipy.linalg.block_diag(*[Vc]*self.blocks)
-
-    # Initialize state matrix Lambda
-    self.Lambda_re = self.get('Lambda_re', lambda rng, shape: Lambda.real, nj.rng(), (None,))
-    self.Lambda_im = self.get('Lambda_im', lambda rng, shape: Lambda.imag, nj.rng(), (None,))
-
-    # V = self.get('V', jnp.zeros, (self.H, self.H))
-    # Vinv = self.get('Vinv', jnp.zeros, (self.H, self.H))
-    # self.Lambda_re = self.get('Lambda_re', jnp.zeros, (self.H,))
-    # self.Lambda_im = self.get('Lambda_im', jnp.zeros, (self.H,))
-
-
-    self.V, self.Vinv = V, Vinv
+    Lambda_re = self.get('Lambda_re', lambda rng, shape: self.Lambda_re_init, nj.rng(), (None,))
+    Lambda_im = self.get('Lambda_im', lambda rng, shape: self.Lambda_im_init, nj.rng(), (None,))
     if self.clip_eigs:
-      self.Lambda = jnp.clip(self.Lambda_re, None, -1e-4) + 1j*self.Lambda_im
+      Lambda = jnp.clip(Lambda_re, None, -1e-4) + 1j*Lambda_im
     else:
-      self.Lambda = self.Lambda_re + 1j*self.Lambda_im
+      Lambda = Lambda_re + 1j*Lambda_im
 
     # Initialize input-to-state matrix B
     local_P = 2*self.P if self.conj_sym else self.P
-    B_init = lecun_normal()
-    B_shape = (local_P, self.H)
-    self.B = self.get('B', lambda rng, shape: init_VinvB(B_init, rng, shape, self.Vinv), nj.rng(), B_shape)
-    B_tilde = self.B[..., 0] + 1j*self.B[..., 1]
+    B = self.get('B', lambda rng, shape: init_VinvB(lecun_normal(), rng, shape, self.Vinv), nj.rng(), (local_P, self.H))
+    B_tilde = B[..., 0] + 1j*B[..., 1]
 
     # Initialize state-to-output matrix C
     if self.C_init in ['trunc_standard_normal']:
@@ -98,73 +83,75 @@ class NinjaxS5Layer(nj.Module):
     if self.C_init in ['complex_normal']:
       if self.bidirectional:
         C = self.get('C', C_init, nj.rng(), (self.H, 2*self.P, 2))
-        self.C_tilde = C[..., 0] + 1j*C[..., 1]
+        C_tilde = C[..., 0] + 1j*C[..., 1]
       else:
         C = self.get('C', C_init, nj.rng(), (self.H, self.P, 2))
-        self.C_tilde = C[..., 0] + 1j*C[..., 1]
+        C_tilde = C[..., 0] + 1j*C[..., 1]
     else:
       if self.bidirectional:
-        self.C1 = self.get('C1', lambda rng, shape: init_CV(C_init, rng, shape, self.V), nj.rng(), C_shape)
-        self.C2 = self.get('C2', lambda rng, shape: init_CV(C_init, rng, shape, self.V), nj.rng(), C_shape)
+        C1 = self.get('C1', lambda rng, shape: init_CV(C_init, rng, shape, self.V), nj.rng(), C_shape)
+        C2 = self.get('C2', lambda rng, shape: init_CV(C_init, rng, shape, self.V), nj.rng(), C_shape)
         C1 = self.C1[..., 0] + 1j*self.C1[..., 1]
         C2 = self.C2[..., 0] + 1j*self.C2[..., 1]
-        self.C_tilde = jnp.concatenate((C1, C2), axis=-1)
+        C_tilde = jnp.concatenate((C1, C2), axis=-1)
       else:
-        self.C = self.get('C', lambda rng, shape: init_CV(C_init, rng, shape, self.V), nj.rng(), C_shape)
-        self.C_tilde = self.C[..., 0] + 1j*self.C[..., 1]
-    
+        C = self.get('C', lambda rng, shape: init_CV(C_init, rng, shape, self.V), nj.rng(), C_shape)
+        C_tilde = C[..., 0] + 1j*C[..., 1]
     # Initialize feedthrough matrix
-    self.D = self.get('D', normal(stddev=1.0), nj.rng(), (self.H,))
+    D = self.get('D', normal(stddev=1.0), nj.rng(), (self.H,))
 
     self.log_step = self.get('log_step', mimo_log_step_initializer, nj.rng(), (self.P, self.dt_min, self.dt_max))
     step = self.step_rescale * jnp.exp(self.log_step[:, 0])
 
     # Discretization
     if self.discretization in ['zoh']:
-      self.Lambda_bar,  self.B_bar = discretize_zoh(self.Lambda, B_tilde, step)
+      Lambda_bar,  B_bar = discretize_zoh(Lambda, B_tilde, step)
     elif self.discretization in ['bilinear']:
-      self.Lambda_bar,  self.B_bar = discretize_bilinear(self.Lambda, B_tilde, step)
+      Lambda_bar,  B_bar = discretize_bilinear(Lambda, B_tilde, step)
     else:
       raise NotImplementedError(f'Discretization method {self.discretization} not implemented')
 
-    # RNN cache to store the internal states
-    # self.x_k_1 = self.variable('cache', 'cache_x_k', jnp.zeros, (self.P,), jnp.complex64)
+    state = jnp.ones((batched_input_sequence.shape[0], batched_input_sequence.shape[1], Lambda_bar.shape[0]), dtype=jnp.complex64)
+    ys, xs = jax.vmap(
+      lambda x, u: apply_ssm_state(x, u, Lambda_bar, B_bar, C_tilde, self.conj_sym, self.bidirectional),
+      in_axes=(0,0), out_axes=(0))(state, batched_input_sequence)
+    Du = jax.vmap(
+      lambda u: D*u,
+      in_axes=0, out_axes=0)(batched_input_sequence)
+    out, state = ys + Du, xs
 
-
-  def __call__(self, batched_input_sequence, state, train=True):
-    # if self.is_mutable_collection('cache'):
-    #   self.x_k_1.value = state
-    if train:
-      # ys, state = jax.vmap(
-      #   lambda u: apply_ssm(self.Lambda_bar, self.B_bar, self.C_tilde, u, self.conj_sym, self.bidirectional),
-      #   in_axes=0, out_axes=0)(batched_input_sequence) 
-      ys, state = jax.vmap(
-        lambda x, u: apply_ssm_state(x, u, self.Lambda_bar, self.B_bar, self.C_tilde, self.conj_sym, self.bidirectional),
-        in_axes=0, out_axes=0)(state, batched_input_sequence) 
-      Du = jax.vmap(
-        lambda u: self.D*u,
-        in_axes=0, out_axes=0)(batched_input_sequence)
-      out = ys + Du
-    else:
-      prev_state = state
-      x_k = jax.vmap(
-        lambda prev_state, u: self.Lambda_bar @ prev_state + self.B_bar @ u,
-        in_axes=0, out_axes=0)(prev_state, batched_input_sequence)
-      y_k = jax.vmap(
-        lambda x_k, u: (self.C_tilde @ x_k).real + self.D * u,
-        in_axes=0, out_axes=0)(x_k, batched_input_sequence)
-      # y_k = (self.C_tilde @ x_k).real + self.D * input
-      out, state = y_k, x_k
     return out, state
 
 
 
   def step(self, input, prev_state):
-    x_k = jax.vmap(
-      lambda prev_state, u: self.Lambda_bar @ prev_state + self.B_bar @ u,
-      in_axes=0, out_axes=0)(prev_state, input)
-    y_k = jax.vmap(
-      lambda x_k, u: (self.C_tilde @ x_k).real + self.D * u,
-      in_axes=0, out_axes=0)(x_k, input)
-    # y_k = (self.C_tilde @ x_k).real + self.D * input
+
+    # Lambda_re = self.get('Lambda_re', lambda rng, shape: self.Lambda_re_init, nj.rng(), (None,))
+    # Lambda_im = self.get('Lambda_im', lambda rng, shape: self.Lambda_im_init, nj.rng(), (None,))
+    Lambda_re = self.get('Lambda_re')
+    Lambda_im = self.get('Lambda_im')
+    B_tilde = self.get('B')[..., 0] + 1j*self.get('B')[..., 1]
+    step = self.step_rescale * jnp.exp(self.get('log_step')[:, 0])
+    if self.clip_eigs:
+      Lambda = jnp.clip(Lambda_re, None, -1e-4) + 1j*Lambda_im
+    else:
+      Lambda = Lambda_re + 1j*Lambda_im
+    if self.discretization in ['zoh']:
+      Lambda_bar,  B_bar = discretize_zoh(Lambda, B_tilde, step)
+    elif self.discretization in ['bilinear']:
+      Lambda_bar,  B_bar = discretize_bilinear(Lambda, B_tilde, step)
+    else:
+      raise NotImplementedError(f'Discretization method {self.discretization} not implemented')
+    C_tilde = self.get('C')[..., 0] + 1j*self.get('C')[..., 1]
+    D = self.get('D')
+
+    # x_k = jax.vmap(
+    #   lambda prev_state, u: Lambda_bar @ prev_state + B_bar @ u)(prev_state, input)
+    # y_k = jax.vmap(
+    #   lambda x_k, u: (C_tilde @ x_k).real + D * u,
+    #   in_axes=0, out_axes=0)(x_k, input)
+    # y_k = (C_tilde @ x_k).real + D * input
+
+    x_k = Lambda_bar * prev_state + jax.vmap(lambda u: B_bar @ u)(input)
+    y_k = jax.vmap(lambda x: (C_tilde @ x).real)(x_k) + D*input
     return y_k, x_k

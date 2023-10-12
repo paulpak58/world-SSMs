@@ -20,7 +20,6 @@ from . import ninjax as nj
 from . import generalized_ssm
 
 
-
 @jaxagent.Wrapper
 class Agent(nj.Module):
 
@@ -80,7 +79,6 @@ class Agent(nj.Module):
     metrics = {}
     data = self.preprocess(data)
     state, wm_outs, mets = self.wm.train(data, state)
-    print(f'metrics for world model train {mets}') #TODO
     metrics.update(mets)
     context = {**data, **wm_outs['post']}
     start = tree_map(lambda x: x.reshape([-1] + list(x.shape[2:])), context)
@@ -189,7 +187,6 @@ class WorldModel(nj.Module):
     keys = list(self.rssm.initial(1).keys())
     start = {k: v for k, v in start.items() if k in keys}
     start['action'] = policy(start)
-
     def step(prev, _):
       prev = prev.copy()
       state = self.rssm.img_step(prev, prev.pop('action'))
@@ -198,39 +195,13 @@ class WorldModel(nj.Module):
         step, jnp.arange(horizon), start, self.config.imag_unroll)
     traj = {
         k: jnp.concatenate([start[k][None], v], 0) for k, v in traj.items()}
-
-    # def step(prev, _):
-    #   prev = prev.copy()
-    #   state = self.rssm.img_step(prev, prev.pop('action'))
-    #   return {**state, 'action': policy(state)}
-    # inputs = jnp.arange(horizon)
-    # length = len(jax.tree_util.tree_leaves(inputs)[0])
-    # carrydef = jax.tree_util.tree_structure(start)
-    # carry = start
-    # outs = []
-    # fn2 = lambda carry,input: (step(carry,input),)*2
-    # for i in range(length):
-    #   carry, out = fn2(carry, tree_map(lambda x: x[i], inputs))
-    #   flat, treedef = jax.tree_util.tree_flatten(out)
-    #   assert treedef==carrydef
-    #   outs.append(flat)
-    # outs = [
-    #     jnp.stack([carry[i] for carry in outs], 0)
-    #     for i in range(len(outs[0]))]
-    # # print(f'outs shape {len(outs)}')
-    # traj = carrydef.unflatten(outs)
-    # # traj = jax.tree_util.tree_unflatten(treedef, outs)
-    # traj = {k: jnp.concatenate([start[k][None], v], 0) for k, v in traj.items()}
-
     cont = self.heads['cont'](traj).mode()
     traj['cont'] = jnp.concatenate([first_cont[None], cont[1:]], 0)
     discount = 1 - 1 / self.config.horizon
     traj['weight'] = jnp.cumprod(discount * traj['cont'], 0) / discount
     return traj
-  
 
   def report(self, data):
-    raise NotImplementedError('report not implemented')
     state = self.initial(len(data['is_first']))
     report = {}
     report.update(self.loss(data, state)[-1][-1])
