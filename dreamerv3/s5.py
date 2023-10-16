@@ -16,13 +16,13 @@ from initializers import make_DPLR_HiPPO
 # Instantiates a single S5 layer
 ###############################
 def S5LayerInit(
-  blocks, init_block_size, Lambda_re_init, Lambda_im_init, V, Vinv,
+  blocks, init_block_size, 
   H, P, C_init, discretization, dt_min, dt_max, conj_sym, clip_eigs, bidirectional,
   name='ssm'
 ):
   # H=d_model, P=ssm_size
   return partial(
-    S5, blocks=blocks, init_block_size=init_block_size, Lambda_re_init=Lambda_re_init, Lambda_im_init=Lambda_im_init, V=V, Vinv=Vinv,
+    S5, blocks=blocks, init_block_size=init_block_size, 
     H=H, P=P, C_init=C_init, discretization=discretization, dt_min=dt_min, dt_max=dt_max, conj_sym=conj_sym, clip_eigs=clip_eigs, bidirectional=bidirectional,
     name=name)
 
@@ -34,15 +34,15 @@ def S5LayerInit(
 class S5(nj.Module):
 
   def __init__(self, blocks:int, init_block_size:int, 
-    Lambda_re_init:jax.Array, Lambda_im_init:jax.Array, V:jax.Array, Vinv:jax.Array, H:int, P:int,
+    H:int, P:int,
     C_init:str, discretization:str, dt_min:float, dt_max:float, conj_sym:bool=True, clip_eigs:bool=False, bidirectional:bool=False, step_rescale:float=1.0
   ):
-    # self.blocks = blocks
-    # self.init_block_size = init_block_size
-    self.Lambda_re_init = Lambda_re_init
-    self.Lambda_im_init = Lambda_im_init
-    self.V = V
-    self.Vinv = Vinv
+    self.blocks = blocks
+    self.init_block_size = init_block_size
+    # self.Lambda_re_init = Lambda_re_init
+    # self.Lambda_im_init = Lambda_im_init
+    # self.V = V
+    # self.Vinv = Vinv
 
     self.H = H
     self.P = P
@@ -54,11 +54,43 @@ class S5(nj.Module):
     self.clip_eigs = clip_eigs
     self.bidirectional = bidirectional
     self.step_rescale = step_rescale
+
+    # self.Lambda_re_init = self.get('Lambda_re', lambda rng, shape: normal(stddev=0.5**0.5), nj.rng(), (self.blocks,))
+    # self.Lambda_im_init = self.get('Lambda_im', lambda rng, shape: normal(stddev=0.5**0.5), nj.rng(), (self.blocks,))
+    # self.V = self.get('V', lambda rng, shape: lecun_normal(), nj.rng(), (self.H, self.init_block_size))
+    # self.Vinv = self.get('Vinv', lambda rng, shape: lecun_normal(), nj.rng(), (self.init_block_size, self.H))
+
+
+  def init_hippo_components(self):
+    Lambda, _, B, V, B_orig = make_DPLR_HiPPO(self.init_block_size)
+    block_size = self.init_block_size//2 if self.conj_sym else self.init_block_size # conj. pairs halve the state space
+    Lambda = Lambda[:block_size]
+    V = V[:, :block_size]
+    Vc = V.conj().T
+    # Put each HiPPO on each block diagonal
+    Lambda = (Lambda * jnp.ones((self.blocks, block_size))).ravel()
+    V = jax.scipy.linalg.block_diag(*[V]*self.blocks)
+    Vinv = jax.scipy.linalg.block_diag(*[Vc]*self.blocks)
+    return Lambda, V, Vinv
+
     
   def __call__(self, batched_input_sequence, init_state):
 
-    Lambda_re = self.get('Lambda_re', lambda rng, shape: self.Lambda_re_init, nj.rng(), (None,))
-    Lambda_im = self.get('Lambda_im', lambda rng, shape: self.Lambda_im_init, nj.rng(), (None,))
+    # Lambda, V, Vinv = self.init_hippo_components()
+    Lambda, V, Vinv = self.init_hippo_components()
+    Lambda_re = self.get('Lambda_re', lambda rng, shape: Lambda.real, nj.rng(), (None,))
+    Lambda_im = self.get('Lambda_im', lambda rng, shape: Lambda.imag, nj.rng(), (None,))
+    V = self.get('V', lambda rng, shape: V, nj.rng(), (None,))
+    Vinv = self.get('Vinv', lambda rng, shape: Vinv, nj.rng(), (None,))
+
+    # Lambda_re = self.get('Lambda_re', lambda rng, shape: self.Lambda_re_init, nj.rng(), (None,))
+    # Lambda_im = self.get('Lambda_im', lambda rng, shape: self.Lambda_im_init, nj.rng(), (None,))
+
+    # Lambda_re = self.get('Lambda_re', normal(stddev=0.5**0.5), nj.rng(), (self.blocks,))
+    # Lambda_im = self.get('Lambda_im', normal(stddev=0.5**0.5), nj.rng(), (self.blocks,))
+    # V = self.get('V',lecun_normal(), nj.rng(), (self.H, self.blocks))
+    # Vinv = self.get('Vinv', lecun_normal(), nj.rng(), (self.blocks, self.blocks))
+
     if self.clip_eigs:
       Lambda = jnp.clip(Lambda_re, None, -1e-4) + 1j*Lambda_im
     else:
@@ -66,7 +98,7 @@ class S5(nj.Module):
 
     # Initialize input-to-state matrix B
     local_P = 2*self.P if self.conj_sym else self.P
-    B = self.get('B', lambda rng, shape: init_VinvB(lecun_normal(), rng, shape, self.Vinv), nj.rng(), (local_P, self.H))
+    B = self.get('B', lambda rng, shape: init_VinvB(lecun_normal(), rng, shape, Vinv), nj.rng(), (local_P, self.H))
     B_tilde = B[..., 0] + 1j*B[..., 1]
 
     # Initialize state-to-output matrix C
@@ -89,13 +121,13 @@ class S5(nj.Module):
         C_tilde = C[..., 0] + 1j*C[..., 1]
     else:
       if self.bidirectional:
-        C1 = self.get('C1', lambda rng, shape: init_CV(C_init, rng, shape, self.V), nj.rng(), C_shape)
-        C2 = self.get('C2', lambda rng, shape: init_CV(C_init, rng, shape, self.V), nj.rng(), C_shape)
+        C1 = self.get('C1', lambda rng, shape: init_CV(C_init, rng, shape, V), nj.rng(), C_shape)
+        C2 = self.get('C2', lambda rng, shape: init_CV(C_init, rng, shape, V), nj.rng(), C_shape)
         C1 = self.C1[..., 0] + 1j*self.C1[..., 1]
         C2 = self.C2[..., 0] + 1j*self.C2[..., 1]
         C_tilde = jnp.concatenate((C1, C2), axis=-1)
       else:
-        C = self.get('C', lambda rng, shape: init_CV(C_init, rng, shape, self.V), nj.rng(), C_shape)
+        C = self.get('C', lambda rng, shape: init_CV(C_init, rng, shape, V), nj.rng(), C_shape)
         C_tilde = C[..., 0] + 1j*C[..., 1]
     # Initialize feedthrough matrix
     D = self.get('D', normal(stddev=1.0), nj.rng(), (self.H,))
@@ -128,6 +160,7 @@ class S5(nj.Module):
 
     # Lambda_re = self.get('Lambda_re', lambda rng, shape: self.Lambda_re_init, nj.rng(), (None,))
     # Lambda_im = self.get('Lambda_im', lambda rng, shape: self.Lambda_im_init, nj.rng(), (None,))
+    # Lambda, V, Vinv = self.init_hippo_components()
     Lambda_re = self.get('Lambda_re')
     Lambda_im = self.get('Lambda_im')
     B_tilde = self.get('B')[..., 0] + 1j*self.get('B')[..., 1]

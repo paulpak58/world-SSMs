@@ -32,17 +32,39 @@ def make_DPLR_HiPPO(N):
 
 def discretize_zoh(Lambda, B, step):
     Lambda_bar = torch.exp(Lambda*step)
-    B_bar = (1/Lambda)*(Lambda_bar-torch.ones_like(Lambda_bar))[..., None]*B
+    B_bar = ((1/Lambda)*(Lambda_bar-1))[..., None]*B
     return Lambda_bar, B_bar
-
 
 def parallel_scan(Ls, us):
     return Ls, us 
 
 
+def get_activation(activation):
+    if activation == "relu":
+        return nn.ReLU()
+    elif activation == "tanh":
+        return nn.Tanh()
+    elif activation == "elu":
+        return nn.ELU()
+    elif activation == "gelu":
+        return nn.GELU()
+    elif activation == "leaky_relu":
+        return nn.LeakyReLU()
+    elif activation == "sigmoid":
+        return nn.Sigmoid()
+    elif activation == "softplus":
+        return nn.Softplus()
+    elif activation == "none":
+        return nn.Identity()
+    else:
+        raise ValueError(f"Unknown activation function {activation}")
+
+
+
+
 
 class S5(nn.Module):
-    def __init__(self, blocks, ssm_size, d_model, conj_sym, clip_eigs, dt_max, dt_min, step_rescale):
+    def __init__(self, blocks, ssm_size, d_model, conj_sym, clip_eigs, dt_max, dt_min, step_rescale, activation="relu"):
         super().__init__()
         self.ssm_size = ssm_size
         self.conj_sym = conj_sym
@@ -51,6 +73,7 @@ class S5(nn.Module):
         self.dt_max = dt_max
         self.dt_min = dt_min
         self.step_rescale = step_rescale
+        self.activation = activation
 
         block_size = ssm_size//blocks
 
@@ -71,14 +94,17 @@ class S5(nn.Module):
         state_to_output = (d_model, local_ssm_size, 2)
         feedthrough = (d_model,)
 
-        self.B = nn.Parameter(torch.empty(input_to_state))
-        torch.nn.init.xavier_normal_(self.B)
+        # self.B = nn.Parameter(torch.empty(input_to_state))
+        # torch.nn.init.xavier_normal_(self.B)
+        B = torch.randn(input_to_state)
+        VinvB = self.Vinv @ B.to(torch.complex64)
+        self.B = nn.Parameter(torch.concatenate([VinvB.real[..., None], VinvB.imag[..., None]], axis=-1))
 
         C = torch.normal(mean=0.0, std=1.0, size=state_to_output)
         CV = (C[..., 0] + 1j*C[..., 1]) @ self.V
         self.C = nn.Parameter(torch.concatenate((CV.real[..., None], CV.imag[..., None]), axis=-1))
         self.D = nn.Parameter(torch.randn(feedthrough))
-        self.step = nn.Parameter(torch.log(torch.rand((d_model, 1)) * (dt_max-dt_min) + dt_min))
+        self.step = nn.Parameter(torch.log(torch.rand((local_ssm_size, 1)) * (dt_max-dt_min) + dt_min))
 
     def forward(self, u):
         if self.clip_eigs:
@@ -87,48 +113,44 @@ class S5(nn.Module):
             Lambda = self.Lambda_re + 1j*self.Lambda_imag
 
         B_tilde = self.B[..., 0] + 1j*self.B[..., 1]
+        C_tilde = self.C[..., 0] + 1j*self.C[..., 1]
 
-        Lambda_bar, B_bar = discretize_zoh(Lambda, B_tilde, self.step)
+        step = self.step_rescale * torch.exp(self.step.squeeze())
+
+        Lambda_bar, B_bar = discretize_zoh(Lambda, B_tilde, step)
 
         Lambda = Lambda[None, None, ...].repeat((u.shape[0], u.shape[1], 1))
 
-        # Lambda_bar = Lambda_bar[None, ...] * torch.ones((u.shape[0], 1, self.block_size))
-        print(f'u and b bar shape {u.shape} {B_bar.shape}')
-        Bu = torch.matmul(u, B_bar.T)    # (B,L,d_model)*(d_model,ssm_size)
+        Bu = u.to(torch.complex64) @ B_bar.T    # (L,bsz,d)x(d,ssm_size)
 
-        _, state = parallel_scan(Lambda_bar, Bu)
+        _, state = parallel_scan(Lambda_bar, Bu)    # (L,bsz,ssm_size)x(L,bsz,ssm_size)
 
-        return state
-        
+        y = torch.matmul(state, C_tilde.T).real + self.D*u
+
+        y = self.act(y)
+
+        return y, state
+    
 
 
-"""
 class StackedSSM(nn.Module): 
     def __init__(
-      self, init_fn, n_layers, dropout, d_model, act, prenorm, batchnorm, bn_momentum,
+        self, ssm_layer, n_layers, **ssm_args
+    #   self, ssm_layer, n_layers, dropout, d_model, act, prenorm, batchnorm, bn_momentum,
     ):
       self.n_layers = n_layers
       # ssm layer attributes
-      self.init_fn = init_fn
-      self.dropout = dropout
-      self.d_model = d_model
-      self.act = act
-      self.prenorm = prenorm
-      self.batchnorm = batchnorm
-      self.bn_momentum = bn_momentum
+      self.ssm_layer = ssm_layer
 
       self.layers = []
       for i in range(n_layers):
-          #TODO
+        self.layers.append(ssm_layer(**ssm_args))
 
-    def __call__(self, x, state=None, mode='train'):
-      for l in range(self.n_layers):
-        x, state = self.get(f'layer_{l}', GeneralSequenceLayer,
-          ssm=self.init_fn, dropout=self.dropout, d_model=self.d_model, activation=self.act,
-          prenorm=self.prenorm, batchnorm=self.batchnorm, bn_momentum=self.bn_momentum
-        )(x, state, mode)
+    def forward(self, x, state=None, mode='train'):
+      for i in range(self.n_layers):
+        x, state = self.layers[i](x, state, mode)
       return x, state
-"""
+
 
 def main():
     blocks = 8
@@ -143,7 +165,7 @@ def main():
     L = 64
     bsz = 4
 
-    us = torch.randn((L, d_model))
+    us = torch.randn((L, bsz, d_model))
     model = S5(blocks, ssm_size, d_model, conj_sym, clip_eigs, dt_max, dt_min, step_rescale)
     print(model(us))
     for name,param in model.named_parameters():

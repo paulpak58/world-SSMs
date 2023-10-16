@@ -209,11 +209,11 @@ class General_RSSM(nj.Module):
     # Vinv = jax.scipy.linalg.block_diag(*[Vc]*self.blocks)
 
 
-    Lambda, V, Vinv = self.init_hippo_components()
+    # Lambda, V, Vinv = self.init_hippo_components()
 
     # Calling this function instantiates a single layer
     init_fn = SSM_MODELS[self.ssm](
-      blocks=self.blocks, init_block_size=self.init_block_size, Lambda_re_init=Lambda.real, Lambda_im_init=Lambda.imag, V=V, Vinv=Vinv,
+      blocks=self.blocks, init_block_size=self.init_block_size, 
       H=self.d_model, P=self.ssm_size, C_init=self.C_init, discretization=self.discretization,
       dt_min=self.dt_min, dt_max=self.dt_max, conj_sym=self.conj_sym, clip_eigs=self.clip_eigs, bidirectional=self.bidirectional, 
     )
