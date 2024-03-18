@@ -7,7 +7,6 @@ log=${home}/world-SSMs/logdir
 
 #export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/:$LD_LIBRARY_PATH
 #export LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:$LD_LIBRARY_PATH
-#cd ${home}/jpl-source-seeking/DRL-robot-navigation/catkin_ws
 #source devel_isolated/setup.bash
 
 source ${conda} wssm
